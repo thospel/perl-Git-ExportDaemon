@@ -5,7 +5,7 @@ use warnings;
 use FindBin qw($Script $Bin);
 
 # If the program runs as /foobar/bin/program, find libraries in /foobar/lib
-my ($base, %state, %pids);
+my ($base, %state, %pids, $private_socket);
 BEGIN {
     # Even on windows FindBin uses / in the reported path
     $Bin = $FindBin::Bin;
@@ -33,10 +33,12 @@ use constant {
     STATE_PATH	=> BASE_PATH . "/state",
     EXPORT_PATH	=> BASE_PATH . "/export",
     SOCKET_PATH	=> BASE_PATH . "/S.git-exportd",
+    LOCK_PATH	=> BASE_PATH . "/git-exportd.lock",
 };
 
 use Git::ExportDaemon qw
-    (is_systemd report mkdirs rmtree rev_parse run_piped escape unescape);
+    (is_systemd report mkdirs rmtree rev_parse run_piped escape unescape
+     lock_file);
 
 sub state_read {
     %state = ();
@@ -214,7 +216,10 @@ sub on_line {
         };
         register($revision, $client->pid);
         my $path = "$dir/$revision";
-        if (!-d $path) {
+        if (-d $path) {
+            report("info", "Already have $commit exported as $path");
+        } else {
+            report("info", "Git exporting $commit as $path");
             rmtree("$path.tmp", 1);
             my $out = run_piped(
                 [["git", "archive", "--prefix=$revision.tmp/", $revision], $repo],
@@ -247,12 +252,11 @@ sub on_accept {
     report("info", "Client '$id' connected: pid $pid, user $user, group $group");
 }
 
+my $lock;
 eval {
     report("info", "Running as pid $$");
 
-    mkdirs(STATE_PATH);
-    mkdirs(EXPORT_PATH);
-    state_read();
+    $lock = lock_file(LOCK_PATH);
 
     my $fh = is_systemd();
     if ($fh) {
@@ -265,16 +269,24 @@ eval {
             $fh = \*STDIN if -S _;
         }
         if (!$fh) {
-            # Todo: Check if we can connect and if so don't unlink
+            $fh = IO::Socket::UNIX->new(Peer => SOCKET_PATH);
+            die "Something is still listening on ", SOCKET_PATH, "\n" if $fh;
+
             unlink(SOCKET_PATH) || $! == ENOENT || $! == ESTALE ||
                 die "Could not unlink '", SOCKET_PATH, "': $!";
             $fh = IO::Socket::UNIX->new(
                 Local => SOCKET_PATH,
                 Listen => undef) ||
                     die "Could not open UNIX socket ", SOCKET_PATH, "($!)";
+            $private_socket = SOCKET_PATH;
+            report("info", "Created listening socket '$private_socket'");
             -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
         }
     }
+
+    mkdirs(STATE_PATH);
+    mkdirs(EXPORT_PATH);
+    state_read();
 
     Git::ExportDaemon->init();
     Git::ExportDaemon->listener(
@@ -286,7 +298,9 @@ eval {
     Git::ExportDaemon->loop();
     report("info", "Exit");
 };
-if (my $err = $@) {
+my $err = $@;
+unlink($private_socket) if defined $private_socket;
+if ($err) {
     report("err", $err);
     report("info", "Exit");
     die $err;

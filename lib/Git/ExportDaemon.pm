@@ -6,10 +6,11 @@ use warnings;
 our $VERSION = "1.000";
 
 use Carp;
-use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT EDOM EACCES);
 use Sys::Syslog;
 use FindBin qw($Script);
 use POSIX qw(F_GETFL F_SETFL O_NONBLOCK _exit);
+use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_NB);
 use Socket qw(SO_PEERCRED SOL_SOCKET);
 
 # use Data::Dumper;
@@ -29,7 +30,7 @@ use constant {
 require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_systemd report blocking mkdirs rmtree escape unescape
-                    rev_parse ls_remote run_piped DEV INO);
+                    rev_parse ls_remote lock_file run_piped DEV INO);
 
 sub report {
     if (-t STDERR) {
@@ -371,6 +372,44 @@ sub listener {
     blocking($fh, 0);
     $class->add_read($fh, sub { $class->acceptable($fh, $callbacks) });
     $all_listeners{$fd} = $fh;
+}
+
+# Try to lock the given file. Already locked is not fatal if $may_block
+# $may_block negative means blocking lock
+# Returns filehandle if locked, false if not, dies on error
+# File will remain locked as long as the filehandle lives
+sub lock_file {
+    my $file = shift;
+    my %params = @_ == 1 ? (may_block => shift) : @_;
+
+    my $may_block = delete $params{may_block};
+
+    croak("Unknown lock_file parameter ",
+          join(", ", map "'$_'", keys %params)) if %params;
+
+    sysopen(my $fh, $file, O_RDWR|O_CREAT) ||
+        croak "Could not create/open $file: $!";
+    if (!flock($fh, LOCK_EX | ($may_block && $may_block < 0 ? 0 : LOCK_NB))) {
+        die "Could not flock '$file': $!" if
+            ($may_block && $may_block < 0) ||
+            !($! == EWOULDBLOCK || ($^O eq "MSWin32" ? $! == EDOM : $! == EACCES));
+        return undef if $may_block;
+        if (defined(my $line = <$fh>)) {
+            if (my ($pid, $program) =
+                    $line =~ /^(\d+)\s+(.*)$/) {
+                croak "Could not flock '$file': already locked, possibly by program '$program' (pid $pid)";
+            }
+        }
+        croak "Could not flock '$file' (already locked)";
+    }
+    seek($fh, 0, 0)  || die "Could not seek to 0 in '$file': $!";
+    truncate($fh, 0) || die "Could not truncate '$file': $!";
+    my $old_fh = select($fh);
+    $| = 1;
+    # The lock file contents are just advisory
+    print("$$ $Script\n") || die "Could not write to '$file': $!\n";
+    select($old_fh);
+    return $fh;
 }
 
 sub mkdirs {
