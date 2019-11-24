@@ -1,0 +1,6 @@
+[Unit]
+Description=Manage temporary exported git repositories
+Requires=git-exportd.socket
+
+[Service]
+ExecStart=%h/perl-modules/Git-ExportDaemon/bin/git-exportd

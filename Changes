@@ -1,0 +1,7 @@
+Revision history for Perl extension Git::ExportDaemon.
+
+1.000	2019-11-24 10:52:29 UT
+
+0.01  Sat Nov 23 22:44:55 2019
+	- original version; created by h2xs 1.23 with options
+		-b 5.8.0 -AXn Git::ExportDaemon

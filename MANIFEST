@@ -1,0 +1,14 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+bin/git-exportd
+lib/Git/ExportDaemon.pm
+lib/Git/ExportDaemon/Package.pm
+md5-versions
+systemd-user/git-exportd.service
+systemd-user/git-exportd.socket
+t/00_load.t
+t/01_syntax.t
+t/TestDrive.pm
+version_check

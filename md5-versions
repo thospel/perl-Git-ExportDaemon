@@ -1,0 +1,35 @@
+# Generated on 2019-11-24 10:52:29 UT using /usr/local/bin/release_pm
+BEGIN
+SEMANTICS	1.013
+DIGITS		3
+RELEASE		1.000
+SUB_RELEASE	007
+DATE		2019-11-24 10:52:29
+VCS_CHECK	1
+VERSION	aac9d94bf8e1d20d32a16fe2626c329b 1.000 Changes
+VERSION	b9b9aa0b1047f8b0b0bfabe03a662df5 1.000 MANIFEST
+VERSION	a6c47c6d8d63cdead9344b6f0594a7ea 1.000 Makefile.PL
+VERSION	4ab352d0e8986aabbba10979e8598e7d 1.000 README
+VERSION	560a79964c6883b25a565a4b11551b29 1.000 bin/git-exportd
+VERSION	1a32375560aa3d08672b1d20e7a73512 1.000 lib/Git/ExportDaemon.pm
+VERSION	715195db8f5a8df9a9630c10525a7d42 1.000 lib/Git/ExportDaemon/Package.pm
+VERSION	1b6120250169126bb89d0a980fcb711d 1.000 systemd-user/git-exportd.service
+VERSION	b20b36b4fcca93818cc2de8075f27abf 1.000 systemd-user/git-exportd.socket
+VERSION	aa234ba251703a25e9762349f5199dc9 1.000 t/00_load.t
+VERSION	770c42888ee70e3e6d8105caa75bb4d3 1.000 t/01_syntax.t
+VERSION	4518fb46dd1d055dbdc20f74b47ae1e2 1.000 t/TestDrive.pm
+VERSION	b09f2e5a9e871fc2c9a6d8e135659f65 1.000 version_check
+RELEASED 1.000 1.000 Changes
+RELEASED 1.000 1.000 MANIFEST
+RELEASED 1.000 1.000 Makefile.PL
+RELEASED 1.000 1.000 README
+RELEASED 1.000 1.000 bin/git-exportd
+RELEASED 1.000 1.000 lib/Git/ExportDaemon.pm
+RELEASED 1.000 1.000 lib/Git/ExportDaemon/Package.pm
+RELEASED 1.000 1.000 systemd-user/git-exportd.service
+RELEASED 1.000 1.000 systemd-user/git-exportd.socket
+RELEASED 1.000 1.000 t/00_load.t
+RELEASED 1.000 1.000 t/01_syntax.t
+RELEASED 1.000 1.000 t/TestDrive.pm
+RELEASED 1.000 1.000 version_check
+END

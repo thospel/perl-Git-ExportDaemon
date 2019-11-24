@@ -1,0 +1,293 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+
+use FindBin qw($Script $Bin);
+
+# If the program runs as /foobar/bin/program, find libraries in /foobar/lib
+my ($base, %state, %pids);
+BEGIN {
+    # Even on windows FindBin uses / in the reported path
+    $Bin = $FindBin::Bin;
+    $Bin =~ s{/+\z}{};
+    $Bin =~
+        ($^O eq "MSWin32" ?
+         qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
+         qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
+         die "Could not parse bin directory '$Bin'";
+    # Use untainted version of lib
+    my $base = $1;
+    require lib;
+    # Support a simple --blib option for pre-install testing
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$base/blib/lib" : "$base/lib");
+}
+
+use IO::Socket::UNIX;
+use Errno qw(ENOENT ESTALE);
+
+use constant {
+    BASE_PATH	=> "state/Git-ExportDaemon",
+};
+
+use constant {
+    STATE_PATH	=> BASE_PATH . "/state",
+    EXPORT_PATH	=> BASE_PATH . "/export",
+    SOCKET_PATH	=> BASE_PATH . "/S.git-exportd",
+};
+
+use Git::ExportDaemon qw
+    (is_systemd report mkdirs rmtree rev_parse run_piped escape unescape);
+
+sub state_read {
+    %state = ();
+    %pids = ();
+
+    my $dir = STATE_PATH;
+    opendir(my $dh, $dir) || die "Could not opendir '$dir': $!";
+    for my $f (readdir($dh)) {
+        next if $f eq "." || $f eq "..";
+        my $path = "$dir/$f";
+        if (my ($revision) = $f =~ /^([0-9a-f]{40})\z/) {
+            my $exp_path = EXPORT_PATH . "/$f";
+            lstat($exp_path) || $! == ENOENT || $! == ESTALE ||
+                die "Could not lstat($exp_path): $!";
+            if (-d _) {
+                open(my $fh, "<", $path) || die "Could not open '$path': $!";
+                local $_;
+                while (<$fh>) {
+                    my ($pid) = /^(\d+)\n/ or do {
+                        report("warning", "State file '$path' is damaged");
+                        last;
+                    };
+                    $state{$revision}{$pid} ||= 1;
+                    $pids{$pid}{$revision} ||= 1;
+                }
+                next;
+            }
+        }
+        rmtree($path);
+    }
+    closedir($dh) || die "Could not closedir '$dir': $!";
+
+    # Check if any pids are gone
+    my %update;
+    while (my ($pid, $revisions) = each %pids) {
+        next if kill(0, $pid) && $pid != $$ && $pid > 1;
+        delete $pids{$pid};
+        my @revisions = keys %$revisions;
+        @update{@revisions} = ();
+        for my $revision (@revisions) {
+            delete $state{$revision}{$pid};
+        }
+    }
+
+    # Rewrite the state file for any pids that are gone
+    for my $revision (keys %update) {
+        my $path = "$dir/$revision";
+        my @pids = sort { $a <=> $b } keys %{$state{$revision}};
+        if (@pids) {
+            open(my $fh, ">>", "$path.tmp") ||
+                die "Could not append to '$path.tmp': $!";
+            eval {
+                print($fh map "$_\n", @pids) ||
+                    die "Could not write to '$path.tmp': $!";
+                close($fh) || die "Could not close '$path.tmp': $!";
+                rename("$path.tmp", $path) ||
+                    die "Could not rename '$path.tmp' to '$path': $!";
+            };
+            if (my $err = $@) {
+                rmtree("$path.tmp");
+                die $err;
+            }
+        } else {
+            delete $state{$revision};
+            rmtree($path);
+        }
+    }
+
+    # Clean up any exports we don't know about
+    my $exp_dir = EXPORT_PATH;
+    opendir($dh, $exp_dir) || die "Could not opendir '$exp_dir': $!";
+    rmtree("$exp_dir/delete", 1);
+    my $delete;
+    for my $f (readdir($dh)) {
+        next if $f eq "." || $f eq "..";
+        my $path = "$exp_dir/$f";
+        next if exists $state{$f};
+        if (!$delete) {
+            mkdirs("$exp_dir/delete");
+            $delete = 1;
+        }
+        report("info", "removing $path");
+        rename($path, "$exp_dir/delete/$f") ||
+            die "Could not rename '$path' to '$exp_dir/delete/$f'";
+    }
+    rmtree("$exp_dir/delete", 1) if $delete;
+
+    closedir($dh) || die "Could not closedir '$exp_dir': $!";
+}
+
+sub register {
+    my ($revision, $pid) = @_;
+
+    return if exists $state{$revision} && $state{$revision}{$pid};
+
+    my $file = STATE_PATH . "/$revision";
+    open(my $fh, ">>", $file) || die "Could not open '$file' for append: $!";
+    print($fh "$pid\n") || die "Could not write to '$file': $!";
+    close($fh) || die "Error closing '$file': $!";
+    $state{$revision}{$pid} ||= 1;
+    $pids{$pid}{$revision}  ||=1;
+}
+
+sub on_quit {
+    my ($client, $reason) = @_;
+
+    my $id = $client->id;
+    report("info", "Client '$id' quit: $reason");
+
+    # Maybe we shut down because the given pid is gone...
+    my $pid = $client->pid;
+    if (!kill(0, $pid)) {
+        if (my $revisions = delete $pids{$pid}) {
+            for my $revision (keys %$revisions) {
+                delete $state{$revision}{$pid};
+                delete $state{$revision} if !%{$state{$revision}};
+            }
+            # Be more carefull deleteing in EXPORT_PATH
+            # We want absolutely no risk of partial deletes
+            my @delete;
+            my $exp_dir = EXPORT_PATH;
+            for my $revision (keys %$revisions) {
+                next if $state{$revision};
+                rmtree(STATE_PATH . "/$revision");
+                my $path = "$exp_dir/$revision";
+                lstat($path) || $! == ENOENT || $! == ESTALE ||
+                    die "Could not lstat($path): $!";
+                push @delete, $revision if -e _;
+            }
+            if (@delete) {
+                rmtree("$exp_dir/delete", 1);
+                mkdirs("$exp_dir/delete");
+                for my $revision (@delete) {
+                    my $path = "$exp_dir/$revision";
+                    report("info", "removing $path");
+                    rename($path, "$exp_dir/delete/$revision") ||
+                        die "Could not rename '$path' to '$exp_dir/delete/$revision'";
+                }
+                rmtree("$exp_dir/delete", 1);
+            }
+        }
+    }
+}
+
+sub on_line {
+    my ($client, $line) = @_;
+
+    my @args = split " ", $line or return;
+    $_ = unescape($_) for @args;
+    my $command = uc shift @args;
+    my $id    = $client->id;
+
+    if ($command eq "SHUTDOWN") {
+        Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
+        # Cleanup before shutdown
+        state_read();
+    } elsif ($command eq "QUIT") {
+        $client->finish("Manual quit", "221 Goodbye\n");
+    } elsif ($command eq "EXPORT") {
+        if (@args < 1) {
+            $client->output("501 Missing argument\n");
+            return;
+        }
+        my $repo   = shift @args;
+        my $commit = shift @args // "HEAD";
+        # my $dir    = shift @args;
+        my $dir = EXPORT_PATH;
+        if (@args) {
+            $client->output("501 Spurious argument\n");
+            return;
+        }
+        my $revision = rev_parse($repo, $commit) // do {
+            $client->output("503 Could not determine revision for $commit\n");
+            return;
+        };
+        register($revision, $client->pid);
+        my $path = "$dir/$revision";
+        if (!-d $path) {
+            rmtree("$path.tmp", 1);
+            my $out = run_piped(
+                [["git", "archive", "--prefix=$revision.tmp/", $revision], $repo],
+                [["tar", "-x"], $dir]);
+            if (!defined $out) {
+                rmtree("$path.tmp", 1);
+                $client->output("401 Git error\n");
+                return;
+            }
+            rename("$path.tmp", $path) || do {
+                my $err = $@;
+                rmtree("$path.tmp", 1);
+                dir $err;
+            };
+        }
+        $path = escape($path);
+        $client->output("251 $path\n");
+    } else {
+        $client->output("502 Unknown command '$command'\n");
+    }
+}
+
+sub on_accept {
+    my ($client) = @_;
+
+    my $pid   = $client->pid;
+    my $user  = $client->user;
+    my $group = $client->group;
+    my $id    = $client->id;
+    report("info", "Client '$id' connected: pid $pid, user $user, group $group");
+}
+
+eval {
+    report("info", "Running as pid $$");
+
+    mkdirs(STATE_PATH);
+    mkdirs(EXPORT_PATH);
+    state_read();
+
+    my $fh = is_systemd();
+    if ($fh) {
+        stat($fh) or die "Could not stat passed filehandle: $!";
+        -S $fh || die "Passed filehandle is not a socket\n";
+    } else {
+        my $fd = fileno(STDIN);
+        if (defined $fd) {
+            stat(STDIN) or die "Could not stat STDIN: $!";
+            $fh = \*STDIN if -S _;
+        }
+        if (!$fh) {
+            # Todo: Check if we can connect and if so don't unlink
+            unlink(SOCKET_PATH) || $! == ENOENT || $! == ESTALE ||
+                die "Could not unlink '", SOCKET_PATH, "': $!";
+            $fh = IO::Socket::UNIX->new(
+                Local => SOCKET_PATH,
+                Listen => undef) ||
+                    die "Could not open UNIX socket ", SOCKET_PATH, "($!)";
+            -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
+        }
+    }
+
+    Git::ExportDaemon->init();
+    Git::ExportDaemon->listener(
+        $fh,
+        on_quit   => \&on_quit,
+        on_line   => \&on_line,
+        on_accept => \&on_accept,
+    );
+    Git::ExportDaemon->loop();
+    report("info", "Exit");
+};
+if (my $err = $@) {
+    report("err", $err);
+    report("info", "Exit");
+    die $err;
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Manage temporary exported git repositories
+
+[Socket]
+ListenStream=%t/Git-ExportDaemon/S.git-exportd
+FileDescriptorName=std
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target
