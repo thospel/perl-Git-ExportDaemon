@@ -10,7 +10,8 @@ use Carp;
 use Cwd;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT EDOM EACCES);
 use POSIX qw(F_GETFL F_SETFL O_NONBLOCK _exit);
-use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_NB);
+use Fcntl qw
+    (O_RDWR O_CREAT LOCK_EX LOCK_NB S_IFMT S_IFLNK);
 use Socket qw(SO_PEERCRED SOL_SOCKET);
 use Sys::Syslog;
 use IO::Socket::UNIX;
@@ -24,6 +25,7 @@ use constant {
     BLOCK			=> 2**12,
     DEV				=> 0,
     INO				=> 1,
+    MODE			=> 2,
     MTIME			=> 9,
 
     NAME_SOCKET			=> "S.git-exportd",
@@ -48,10 +50,10 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     NAME_SOCKET DEV INO
-     client_git_export client_response_parse
-     git_rev_parse git_ls_remote git_dir run_piped is_systemd mkdirs rmtree
-     cwd_path lock_file blocking report report_start escape unescape);
+     NAME_SOCKET DEV INO MODE
+     client_git_export client_response_parse git_rev_parse git_ls_remote git_dir
+     run_piped is_systemd mkdirs rmtree permtree cwd_path lock_file blocking
+     dir_ro dir_rw report report_start escape unescape);
 
 sub report_start {
     my $ident    = shift // $Script;
@@ -494,27 +496,97 @@ sub rmtree {
     my ($path, %params) = @_;
 
     # lstat so we don't follow symlinks
-    lstat($path) or do {
+    my @lstat = lstat($path) or do {
         return if $! == ENOENT || $! == ESTALE;
         die "Could not lstat($path): $!";
     };
+    my $mode = $lstat[MODE] & 07777;
     if (!$params{silent}) {
         report("info", "removing $path");
         $params{silent} = 1;
     }
     if (-d _) {
-        my $keep_top = delete $params{keep_top};
+        # Directory must be writable to be able to remove things from it
+        # Directory must be executable to access it
+        # Directory must be readable to list it
+        # Also avoid changes by other (rmtree remains racy though)
+        my $mode_new = ($mode | 0700) & ~ 022;
+        $mode == $mode_new || chmod($mode_new, $path) ||
+            die "Could not chmod($path): $!";
+        my $top_keep = delete $params{top_keep};
         opendir(my $dh, $path) || die "Could not opendir($path): $!";
         for my $f (readdir $dh) {
             next if $f eq "." || $f eq "..";
             rmtree("$path/$f", %params);
         }
-        $keep_top || rmdir($path) || $! == ENOENT || $! == ESTALE ||
+        $top_keep || rmdir($path) || $! == ENOENT || $! == ESTALE ||
             die "Could not rmdir($path): $!";
     } else {
         unlink($path) || $! == ENOENT || $! == ESTALE ||
             die "Could not unlink '$path': $!";
     }
+}
+
+sub permtree {
+    my ($path, $allow, %params) = @_;
+
+    # lstat so we don't follow symlinks
+    my @lstat = lstat($path) or do {
+        return if $! == ENOENT || $! == ESTALE;
+        die "Could not lstat($path): $!";
+    };
+    my $mode = $lstat[MODE] & 07777;
+    if (-d _) {
+        # Remove group and other write, add user read/write/execute
+        my $mode_new = $mode & ~ 022 | 0700;
+        if ($mode_new != $mode) {
+            chmod($mode_new, $path) || die "Could not chmod($path): $!";
+            $mode = $mode_new;
+        }
+        my $top_keep = delete $params{top_keep};
+        opendir(my $dh, $path) || die "Could not opendir($path): $!";
+        for my $f (readdir $dh) {
+            next if $f eq "." || $f eq "..";
+            permtree("$path/$f", $allow, %params);
+        }
+        # If you make the top level directory read-only you cannot
+        # move it to another directory since that needs permission to update ..
+        return if $top_keep;
+    }
+    my $mode_new = $mode & $allow;
+    $mode == $mode_new || S_IFMT($lstat[MODE]) == S_IFLNK ||
+        chmod($mode_new, $path) || die "Could not chmod($path): $!";
+}
+
+# Remove group and other write, Add user read, write, execute
+# (Directory must be writable in order to move it)
+sub dir_rw {
+    my ($path) = @_;
+
+    my @lstat = lstat($path) or do {
+        next if $! == ESTALE || $! == ENOENT;
+        die "Could not lstat($path): $!";
+    };
+    -d _ || return;
+    my $mode = $lstat[MODE] & 07777;
+    my $mode_new = $mode & ~ 022 | 0700;
+    $mode == $mode_new || chmod($mode_new, $path) ||
+        die "Could not chmod($path): $!";
+}
+
+# Remove all write, add user read and execute
+sub dir_ro {
+    my ($path) = @_;
+
+    my @lstat = lstat($path) or do {
+        next if $! == ESTALE || $! == ENOENT;
+        die "Could not lstat($path): $!";
+    };
+    -d _ || return;
+    my $mode = $lstat[MODE] & 07777;
+    my $mode_new = $mode & ~ 0222 | 0500;
+    $mode == $mode_new || chmod($mode_new, $path) ||
+        die "Could not chmod($path): $!";
 }
 
 sub run {

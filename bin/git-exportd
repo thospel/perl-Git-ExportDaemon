@@ -33,8 +33,8 @@ use Git::ExportDaemon qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
      NAME_SOCKET
-     is_systemd report report_start mkdirs rmtree git_rev_parse git_dir
-     run_piped escape unescape lock_file cwd_path);
+     is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
+     run_piped escape unescape lock_file cwd_path dir_rw dir_ro);
 
 use constant {
     PATH_STATE	=> PATH_BASE . "/state",
@@ -59,12 +59,14 @@ sub stage_delete {
     for my $path (@_) {
         report("info", "removing $path");
         my $stage = stage_tmp();
+        # Make writable if directory so we can move it
+        dir_rw($path);
         rename($path, $stage) || die "Could not rename '$path' to '$stage': $!";
     }
 }
 
 sub stage_clean {
-    rmtree(PATH_STAGE, keep_top => 1, silent => 1);
+    rmtree(PATH_STAGE, top_keep => 1, silent => 1);
 }
 
 sub state_read {
@@ -227,17 +229,20 @@ sub export {
         my ($id, $stage_path) = stage_tmp();
         my $out = run_piped(
             [["git", "archive", "--prefix=$id/", $revision], $repo],
-            [["tar", "-x"], PATH_STAGE]);
+            [["tar", "--no-same-permissions", "-x"], PATH_STAGE]);
         if (!defined $out) {
             stage_clean();
             $client->output(CODE_GIT_ERROR, "Git error");
             return;
         }
+        # Allow r-x, but preserve the top level directory or we cannot rename
+        permtree($stage_path, 0555, top_keep => 1);
         rename($stage_path, $path) || do {
-            my $err = $@;
-            stage_clean();
-            die $err;
+            my $err = $!;
+            # stage_clean();
+            die "Could not rename '$stage_path' to '$path': $err";
         };
+        dir_ro($path);
     }
     $path = escape(cwd_path($path));
     $client->output(CODE_EXPORTED, "$revision $path");
