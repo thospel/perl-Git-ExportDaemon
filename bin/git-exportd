@@ -22,35 +22,61 @@ BEGIN {
     "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$base/blib/lib" : "$base/lib");
 }
 
-use IO::Socket::UNIX;
 use Errno qw(ENOENT ESTALE);
+use IO::Socket::UNIX;
 
 use constant {
-    BASE_PATH	=> "state/Git-ExportDaemon",
+    PATH_BASE	=> "state/Git-ExportDaemon",
 };
 
 use constant {
-    STATE_PATH	=> BASE_PATH . "/state",
-    EXPORT_PATH	=> BASE_PATH . "/export",
-    SOCKET_PATH	=> BASE_PATH . "/S.git-exportd",
-    LOCK_PATH	=> BASE_PATH . "/git-exportd.lock",
+    PATH_STATE	=> PATH_BASE . "/state",
+    PATH_EXPORT	=> PATH_BASE . "/export",
+    PATH_STAGE	=> PATH_BASE . "/stage",
+    PATH_SOCKET	=> PATH_BASE . "/S.git-exportd",
+    LOCK_PATH	=> PATH_BASE . "/git-exportd.lock",
 };
 
 use Git::ExportDaemon qw
-    (is_systemd report mkdirs rmtree rev_parse run_piped escape unescape
-     lock_file);
+    (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
+     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
+     is_systemd report mkdirs rmtree git_rev_parse git_dir run_piped
+     escape unescape lock_file cwd_path);
+
+my $umask = 022;
+
+{
+    my $stage_id = "A";
+    sub stage_tmp {
+        my $id = $stage_id++;
+        # Gives just the fresh path in scalar context
+        return $id, PATH_STAGE . "/$id";
+    }
+}
+
+sub stage_delete {
+    for my $path (@_) {
+        report("info", "removing $path");
+        my $stage = stage_tmp();
+        rename($path, $stage) || die "Could not rename '$path' to '$stage': $!";
+    }
+}
+
+sub stage_clean {
+    rmtree(PATH_STAGE, keep_top => 1, silent => 1);
+}
 
 sub state_read {
     %state = ();
     %pids = ();
 
-    my $dir = STATE_PATH;
+    my $dir = PATH_STATE;
     opendir(my $dh, $dir) || die "Could not opendir '$dir': $!";
     for my $f (readdir($dh)) {
         next if $f eq "." || $f eq "..";
         my $path = "$dir/$f";
         if (my ($revision) = $f =~ /^([0-9a-f]{40})\z/) {
-            my $exp_path = EXPORT_PATH . "/$f";
+            my $exp_path = PATH_EXPORT . "/$f";
             lstat($exp_path) || $! == ENOENT || $! == ESTALE ||
                 die "Could not lstat($exp_path): $!";
             if (-d _) {
@@ -88,17 +114,18 @@ sub state_read {
         my $path = "$dir/$revision";
         my @pids = sort { $a <=> $b } keys %{$state{$revision}};
         if (@pids) {
-            open(my $fh, ">>", "$path.tmp") ||
-                die "Could not append to '$path.tmp': $!";
+            my $tmp = stage_tmp();
+            open(my $fh, ">>", $tmp) ||
+                die "Could not append to '$tmp': $!";
             eval {
                 print($fh map "$_\n", @pids) ||
-                    die "Could not write to '$path.tmp': $!";
-                close($fh) || die "Could not close '$path.tmp': $!";
-                rename("$path.tmp", $path) ||
-                    die "Could not rename '$path.tmp' to '$path': $!";
+                    die "Could not write to '$tmp': $!";
+                close($fh) || die "Could not close '$tmp': $!";
+                rename($tmp, $path) ||
+                    die "Could not rename '$tmp' to '$path': $!";
             };
             if (my $err = $@) {
-                rmtree("$path.tmp");
+                stage_clean();
                 die $err;
             }
         } else {
@@ -108,23 +135,17 @@ sub state_read {
     }
 
     # Clean up any exports we don't know about
-    my $exp_dir = EXPORT_PATH;
+    my $exp_dir = PATH_EXPORT;
     opendir($dh, $exp_dir) || die "Could not opendir '$exp_dir': $!";
-    rmtree("$exp_dir/delete", 1);
     my $delete;
     for my $f (readdir($dh)) {
         next if $f eq "." || $f eq "..";
         my $path = "$exp_dir/$f";
         next if exists $state{$f};
-        if (!$delete) {
-            mkdirs("$exp_dir/delete");
-            $delete = 1;
-        }
-        report("info", "removing $path");
-        rename($path, "$exp_dir/delete/$f") ||
-            die "Could not rename '$path' to '$exp_dir/delete/$f'";
+        $delete ||= 1;
+        stage_delete($path);
     }
-    rmtree("$exp_dir/delete", 1) if $delete;
+    stage_clean() if $delete;
 
     closedir($dh) || die "Could not closedir '$exp_dir': $!";
 }
@@ -134,7 +155,7 @@ sub register {
 
     return if exists $state{$revision} && $state{$revision}{$pid};
 
-    my $file = STATE_PATH . "/$revision";
+    my $file = PATH_STATE . "/$revision";
     open(my $fh, ">>", $file) || die "Could not open '$file' for append: $!";
     print($fh "$pid\n") || die "Could not write to '$file': $!";
     close($fh) || die "Error closing '$file': $!";
@@ -156,31 +177,69 @@ sub on_quit {
                 delete $state{$revision}{$pid};
                 delete $state{$revision} if !%{$state{$revision}};
             }
-            # Be more carefull deleteing in EXPORT_PATH
+            # Be more carefull deleting in PATH_EXPORT
             # We want absolutely no risk of partial deletes
-            my @delete;
-            my $exp_dir = EXPORT_PATH;
+            my $delete;
+            my $exp_dir = PATH_EXPORT;
             for my $revision (keys %$revisions) {
                 next if $state{$revision};
-                rmtree(STATE_PATH . "/$revision");
+                rmtree(PATH_STATE . "/$revision");
                 my $path = "$exp_dir/$revision";
                 lstat($path) || $! == ENOENT || $! == ESTALE ||
                     die "Could not lstat($path): $!";
-                push @delete, $revision if -e _;
-            }
-            if (@delete) {
-                rmtree("$exp_dir/delete", 1);
-                mkdirs("$exp_dir/delete");
-                for my $revision (@delete) {
-                    my $path = "$exp_dir/$revision";
-                    report("info", "removing $path");
-                    rename($path, "$exp_dir/delete/$revision") ||
-                        die "Could not rename '$path' to '$exp_dir/delete/$revision'";
+                if (-e _) {
+                    $delete ||= 1;
+                    stage_delete($path);
                 }
-                rmtree("$exp_dir/delete", 1);
             }
+            stage_clean() if $delete;
         }
     }
+}
+
+sub export {
+    my ($client, $repo, $commit) = @_;
+
+    my $dir = PATH_EXPORT;
+    if (!-d $repo) {
+        if (-e _) {
+            $client->output(CODE_INVALID_REPO, "Repository is not a directory");
+        } else {
+            $client->output(CODE_INVALID_REPO, "Repository does not exist");
+        }
+        return;
+    }
+    if (!defined git_dir($repo)) {
+        $client->output(CODE_INVALID_REPO, "Directory '$repo' is not a repository");
+        return;
+    }
+    my $revision = git_rev_parse($repo, $commit) // do {
+        $client->output(CODE_UNKNOWN_REVISION, "Unknown revision $commit");
+        return;
+    };
+    register($revision, $client->pid);
+    my $path = "$dir/$revision";
+    if (-d $path) {
+        report("info", "Already have $commit exported as $path");
+    } else {
+        report("info", "Git exporting $commit as $path");
+        my ($id, $stage_path) = stage_tmp();
+        my $out = run_piped(
+            [["git", "archive", "--prefix=$id/", $revision], $repo],
+            [["tar", "-x"], PATH_STAGE]);
+        if (!defined $out) {
+            stage_clean();
+            $client->output(CODE_GIT_ERROR, "Git error");
+            return;
+        }
+        rename($stage_path, $path) || do {
+            my $err = $@;
+            stage_clean();
+            die $err;
+        };
+    }
+    $path = cwd_path(escape($path));
+    $client->output(CODE_EXPORTED, $path);
 }
 
 sub on_line {
@@ -191,54 +250,36 @@ sub on_line {
     my $command = uc shift @args;
     my $id    = $client->id;
 
-    if ($command eq "SHUTDOWN") {
-        Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
-        # Cleanup before shutdown
-        state_read();
-    } elsif ($command eq "QUIT") {
-        $client->finish("Manual quit", "221 Goodbye\n");
-    } elsif ($command eq "EXPORT") {
+    if ($command eq "EXPORT") {
         if (@args < 1) {
-            $client->output("501 Missing argument\n");
+            $client->output(CODE_WRONG_ARGUMENTS, "Missing argument(s)");
             return;
         }
         my $repo   = shift @args;
         my $commit = shift @args // "HEAD";
-        # my $dir    = shift @args;
-        my $dir = EXPORT_PATH;
         if (@args) {
-            $client->output("501 Spurious argument\n");
+            $client->output(CODE_WRONG_ARGUMENTS, "Spurious argument(s)");
             return;
         }
-        my $revision = rev_parse($repo, $commit) // do {
-            $client->output("503 Could not determine revision for $commit\n");
-            return;
-        };
-        register($revision, $client->pid);
-        my $path = "$dir/$revision";
-        if (-d $path) {
-            report("info", "Already have $commit exported as $path");
-        } else {
-            report("info", "Git exporting $commit as $path");
-            rmtree("$path.tmp", 1);
-            my $out = run_piped(
-                [["git", "archive", "--prefix=$revision.tmp/", $revision], $repo],
-                [["tar", "-x"], $dir]);
-            if (!defined $out) {
-                rmtree("$path.tmp", 1);
-                $client->output("401 Git error\n");
-                return;
-            }
-            rename("$path.tmp", $path) || do {
-                my $err = $@;
-                rmtree("$path.tmp", 1);
-                dir $err;
-            };
-        }
-        $path = escape($path);
-        $client->output("251 $path\n");
+        export($client, $repo, $commit);
+        return;
+    } elsif ($command eq "HELP") {
+        $client->output(CODE_HELP, <<"EOT")
+Commands supported:
+EXPORT <repo> [<commit>]
+QUIT
+SHUTDOWN
+HELP
+EOT
+            ;
+    } elsif ($command eq "QUIT") {
+        $client->finish(CODE_QUIT, "Manual quit", "Goodbye");
+    } elsif ($command eq "SHUTDOWN") {
+        Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
+        # Cleanup before shutdown
+        state_read();
     } else {
-        $client->output("502 Unknown command '$command'\n");
+        $client->output(CODE_UNKNOWN_COMMAND, "Unknown command '$command'");
     }
 }
 
@@ -254,9 +295,12 @@ sub on_accept {
 
 my $lock;
 eval {
+    umask($umask);
+
     report("info", "Running as pid $$");
 
-    $lock = lock_file(LOCK_PATH);
+    mkdirs(PATH_BASE);
+    $lock = lock_file(cwd_path(LOCK_PATH));
 
     my $fh = is_systemd();
     if ($fh) {
@@ -269,23 +313,31 @@ eval {
             $fh = \*STDIN if -S _;
         }
         if (!$fh) {
-            $fh = IO::Socket::UNIX->new(Peer => SOCKET_PATH);
-            die "Something is still listening on ", SOCKET_PATH, "\n" if $fh;
-
-            unlink(SOCKET_PATH) || $! == ENOENT || $! == ESTALE ||
-                die "Could not unlink '", SOCKET_PATH, "': $!";
+            if (-e PATH_SOCKET) {
+                -S _ || die "Path '", PATH_SOCKET, "' exists but is not a socket\n";
+                die "Something is still listening on '", PATH_SOCKET, "'\n" if
+                    IO::Socket::UNIX->new(Peer => PATH_SOCKET);
+            } else {
+                # Check for dangling symlink
+                -l PATH_SOCKET;
+            }
+            !-e _ || unlink(PATH_SOCKET) || $! == ENOENT || $! == ESTALE ||
+                    die "Could not unlink '", PATH_SOCKET, "': $!";
             $fh = IO::Socket::UNIX->new(
-                Local => SOCKET_PATH,
+                Local => PATH_SOCKET,
                 Listen => undef) ||
-                    die "Could not open UNIX socket ", SOCKET_PATH, "($!)";
-            $private_socket = SOCKET_PATH;
-            report("info", "Created listening socket '$private_socket'");
+                    die "Could not open UNIX socket ", PATH_SOCKET, "($!)";
+            $private_socket = PATH_SOCKET;
+            report("info",
+                   "Created listening socket '%s'", cwd_path($private_socket));
             -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
         }
     }
 
-    mkdirs(STATE_PATH);
-    mkdirs(EXPORT_PATH);
+    rmtree(PATH_STAGE, silent => 1);
+    mkdir(PATH_STAGE, 0700) || die "Could not mkdir(", PATH_STAGE, "): $!";
+    mkdirs(PATH_STATE);
+    mkdirs(PATH_EXPORT);
     state_read();
 
     Git::ExportDaemon->init();

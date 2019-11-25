@@ -5,13 +5,14 @@ use warnings;
 
 our $VERSION = "1.000";
 
-use Carp;
-use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT EDOM EACCES);
-use Sys::Syslog;
 use FindBin qw($Script);
+use Carp;
+use Cwd;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT EDOM EACCES);
 use POSIX qw(F_GETFL F_SETFL O_NONBLOCK _exit);
 use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_NB);
 use Socket qw(SO_PEERCRED SOL_SOCKET);
+use Sys::Syslog;
 
 # use Data::Dumper;
 
@@ -25,19 +26,41 @@ use constant {
     DEV			=> 0,
     INO			=> 1,
     MTIME		=> 9,
+
+    CODE_SHUTDOWN		=> 101,
+    CODE_HELP			=> 214,
+    CODE_GREETING		=> 220,
+    CODE_QUIT			=> 221,
+    CODE_EXPORTED		=> 251,
+    CODE_INVALID_USER		=> 501,
+    CODE_UNKNOWN_COMMAND	=> 502,
+    CODE_INVALID_PID		=> 503,
+    CODE_INTERNAL_ERROR		=> 504,
+    CODE_WRONG_ARGUMENTS	=> 505,
+    CODE_UNKNOWN_REVISION	=> 506,
+    CODE_GIT_ERROR		=> 507,
+    CODE_INVALID_REPO		=> 508,
 };
 
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw(is_systemd report blocking mkdirs rmtree escape unescape
-                    rev_parse ls_remote lock_file run_piped DEV INO);
+our @EXPORT_OK = qw
+    (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
+     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
+     git_rev_parse git_ls_remote git_dir run_piped is_systemd report blocking
+     mkdirs rmtree cwd_path lock_file escape unescape DEV INO);
 
 sub report {
+    my $level = shift;
+    my $msg = shift // croak "Assertion: No message argument to report";
+    $msg = sprintf($msg, @_) if @_;
+    $msg =~ s/\s+\z//;
+    $msg ne "" || croak "Assertion: Empty report message";
+
     if (-t STDERR) {
-        my $level = shift;
-        print STDERR "Log($level): @_\n";
+        print STDERR "Log($level): $msg\n";
     } else {
-        syslog(@_);
+        syslog($level, $msg);
     }
 }
 
@@ -166,8 +189,19 @@ sub is_systemd {
 
 sub output {
     my $client = shift;
+    my $code   = shift;
+    my $text   = "@_";
+
+    # Ensure exactly one final newline
+    $text =~ s/\n*\z/\n/;
+    # Prefix multiline codes
+    $text =~ s/^/$code-/mg;
+    # But fixup the final code
+    $text =~ s/-(.*)$/ $1/;
+    # $text =~ s/\n/\x0d\x0a/g;
+
     my $was_empty = $client->{buffer_out} eq "";
-    $client->{buffer_out} .= join("", @_);
+    $client->{buffer_out} .= $text;
     if ($was_empty && $client->{buffer_out} ne "") {
         $client->add_write($client->{handle}, sub { $client->can_write() });
     }
@@ -177,17 +211,12 @@ sub output {
 # It doesn't pull the rug out from under you.
 # The real finish happens when your callback returns
 sub finish {
-    my ($client, $reason, $response) = @_;
-    if (!$reason) {
-        report("err", "No finish reason given");
-        $reason = "No reason";
-    }
+    my ($client, $code, $reason, $response) = @_;
+    $reason || croak("Assertion: No finish reason given");
     return if $client->{finishing};
 
-    $response //= "";
-    $response =~ s/\s+\z//;
-    $response ||= "101 $reason";
-    $client->output("$response\n");
+    $response = "Internal error" if $code == CODE_INTERNAL_ERROR;
+    $client->output($code, $response // $reason);
     $client->{finishing} = $reason;
     $client->{buffer_in} = "";
 }
@@ -196,7 +225,7 @@ sub shutdown {
     my ($class, $reason) = @_;
 
     for my $client (values %all_clients) {
-        $client->finish($reason);
+        $client->finish(CODE_SHUTDOWN, $reason);
     }
     for my $listener (values %all_listeners) {
         $class->delete_read($listener);
@@ -239,7 +268,7 @@ sub can_read {
                 $err =~ s/\s+\z//;
                 $err = "on_line callback died: $err";
                 report("err", $err);
-                $client->finish($err, "502 Internal error\n");
+                $client->finish(CODE_INTERNAL_ERROR, $err);
             }
             last if $client->{finishing};
         }
@@ -331,18 +360,17 @@ sub acceptable {
     if ($uid != $> && $uid != 0) {
         my $me = getpwuid($>) || "$>";
         my $user = $client->user;
-        $client->finish("User '$user' connected to server '$me'",
-                       "501 $Script only provides services to user '$me', but you are user '$user'\n");
+        $client->finish(CODE_INVALID_USER,
+                        "User '$user' connected to server '$me'",
+                        "$Script only provides services to user '$me', but you are user '$user'");
     } elsif ($pid <= 1) {
-        $client->finish("Invalid pid '$pid'",
-                       "501 Invalid pid '$pid'\n");
+        $client->finish(CODE_INVALID_PID, "Invalid pid '$pid'");
     } elsif (!kill(0, $pid)) {
         # This should be (almost) impossible
         # (can happen if the process died since making the connect)
-        $client->finish("Undetectable pid '$pid'",
-                       "501 Undetectable pid '$pid'\n");
+        $client->finish(CODE_INVALID_PID, "Undetectable pid '$pid'");
     } else {
-        $client->output("200 $Script ready\n")
+        $client->output(CODE_GREETING, "$Script ready")
     }
 
     eval { $client->{callbacks}{on_accept}->($client) };
@@ -350,7 +378,7 @@ sub acceptable {
         $err =~ s/\s+\z//;
         $err = "on_accept callback died: $err";
         report("err", $err);
-        $client->finish($err, "502 Internal error\n");
+        $client->finish(CODE_INTERNAL_ERROR, $err);
     }
 
     $client->quit($client->{finishing}) if
@@ -372,6 +400,17 @@ sub listener {
     blocking($fh, 0);
     $class->add_read($fh, sub { $class->acceptable($fh, $callbacks) });
     $all_listeners{$fd} = $fh;
+}
+
+# Return full path
+sub cwd_path {
+    my ($path) = @_;
+
+    return $path if $path =~ m{^/};
+
+    my $cwd = getcwd() // die "Could not get current working directory: $!";
+    $cwd =~ s{/*\z}{/$path};
+    return $cwd;
 }
 
 # Try to lock the given file. Already locked is not fatal if $may_block
@@ -436,21 +475,25 @@ sub mkdirs {
 }
 
 sub rmtree {
-    my ($path, $silent) = @_;
+    my ($path, %params) = @_;
 
     # lstat so we don't follow symlinks
     lstat($path) or do {
         return if $! == ENOENT || $! == ESTALE;
         die "Could not lstat($path): $!";
     };
-    report("info", "removing $path") if !$silent;
+    if (!$params{silent}) {
+        report("info", "removing $path");
+        $params{silent} = 1;
+    }
     if (-d _) {
+        my $keep_top = delete $params{keep_top};
         opendir(my $dh, $path) || die "Could not opendir($path): $!";
         for my $f (readdir $dh) {
             next if $f eq "." || $f eq "..";
-            rmtree("$path/$f", 1);
+            rmtree("$path/$f", %params);
         }
-        rmdir($path) || $! == ENOENT || $! == ESTALE ||
+        $keep_top || rmdir($path) || $! == ENOENT || $! == ESTALE ||
             die "Could not rmdir($path): $!";
     } else {
         unlink($path) || $! == ENOENT || $! == ESTALE ||
@@ -541,7 +584,7 @@ sub run_piped {
     return $out;
 }
 
-sub ls_remote {
+sub git_ls_remote {
     my ($repo, $commit) = @_;
 
     my $out = run(["git", "ls-remote", $repo, $commit]) // return undef;
@@ -550,12 +593,21 @@ sub ls_remote {
     return $1;
 }
 
-sub rev_parse {
+sub git_rev_parse {
     my ($repo, $commit) = @_;
 
     my $out = run(["git", "rev-parse", $commit], $repo) // return undef;
     $out =~ s/\s+\z//;
     $out =~ /^([0-9a-f]{40})\z/ || die "Unexpected rev-parse output '$out'";
+    return $1;
+}
+
+sub git_dir {
+    my ($repo) = @_;
+
+    my $out = run(["git", "rev-parse", "--git-dir"], $repo) // return undef;
+    $out =~ s/\n\z//  || die "Unexpected rev-parse output '$out'";
+    $out =~ /^(.+)\z/ || die "Unexpected rev-parse output '$out'";
     return $1;
 }
 
