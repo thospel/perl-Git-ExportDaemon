@@ -29,19 +29,20 @@ use constant {
     PATH_BASE	=> "state/Git-ExportDaemon",
 };
 
+use Git::ExportDaemon qw
+    (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
+     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
+     NAME_SOCKET
+     is_systemd report report_start mkdirs rmtree git_rev_parse git_dir
+     run_piped escape unescape lock_file cwd_path);
+
 use constant {
     PATH_STATE	=> PATH_BASE . "/state",
     PATH_EXPORT	=> PATH_BASE . "/export",
     PATH_STAGE	=> PATH_BASE . "/stage",
-    PATH_SOCKET	=> PATH_BASE . "/S.git-exportd",
+    PATH_SOCKET	=> PATH_BASE . "/" . NAME_SOCKET,
     LOCK_PATH	=> PATH_BASE . "/git-exportd.lock",
 };
-
-use Git::ExportDaemon qw
-    (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
-     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     is_systemd report mkdirs rmtree git_rev_parse git_dir run_piped
-     escape unescape lock_file cwd_path);
 
 my $umask = 022;
 
@@ -238,8 +239,8 @@ sub export {
             die $err;
         };
     }
-    $path = cwd_path(escape($path));
-    $client->output(CODE_EXPORTED, $path);
+    $path = escape(cwd_path($path));
+    $client->output(CODE_EXPORTED, "$revision $path");
 }
 
 sub on_line {
@@ -297,6 +298,7 @@ my $lock;
 eval {
     umask($umask);
 
+    report_start();
     report("info", "Running as pid $$");
 
     mkdirs(PATH_BASE);

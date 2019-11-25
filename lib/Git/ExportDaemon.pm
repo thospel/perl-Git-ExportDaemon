@@ -13,19 +13,20 @@ use POSIX qw(F_GETFL F_SETFL O_NONBLOCK _exit);
 use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_NB);
 use Socket qw(SO_PEERCRED SOL_SOCKET);
 use Sys::Syslog;
+use IO::Socket::UNIX;
 
 # use Data::Dumper;
 
 my (%all_clients, %all_listeners);
 
-openlog($Script, 'cons,pid', 'user');
-
 use constant {
-    LISTEN_FDS_START	=> 3,
-    BLOCK		=> 2**12,
-    DEV			=> 0,
-    INO			=> 1,
-    MTIME		=> 9,
+    LISTEN_FDS_START		=> 3,
+    BLOCK			=> 2**12,
+    DEV				=> 0,
+    INO				=> 1,
+    MTIME			=> 9,
+
+    NAME_SOCKET			=> "S.git-exportd",
 
     CODE_SHUTDOWN		=> 101,
     CODE_HELP			=> 214,
@@ -47,8 +48,18 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     git_rev_parse git_ls_remote git_dir run_piped is_systemd report blocking
-     mkdirs rmtree cwd_path lock_file escape unescape DEV INO);
+     NAME_SOCKET DEV INO
+     client_git_export client_response_parse
+     git_rev_parse git_ls_remote git_dir run_piped is_systemd mkdirs rmtree
+     cwd_path lock_file blocking report report_start escape unescape);
+
+sub report_start {
+    my $ident    = shift // $Script;
+    my $logopt   = shift // "cons,pid";
+    my $facility = shift // "user";
+
+    openlog($ident, $logopt, $facility);
+}
 
 sub report {
     my $level = shift;
@@ -198,6 +209,7 @@ sub output {
     $text =~ s/^/$code-/mg;
     # But fixup the final code
     $text =~ s/-(.*)$/ $1/;
+    # Communication is purely local, so no need for portable newlines
     # $text =~ s/\n/\x0d\x0a/g;
 
     my $was_empty = $client->{buffer_out} eq "";
@@ -277,7 +289,11 @@ sub can_read {
     }
     if (defined $rc) {
         # EOF
-        $client->quit("EOF");
+        if ($client->{finishing}) {
+            $client->quit("Expected EOF ($client->{finishing})");
+        } else {
+            $client->quit("Unexpected EOF");
+        }
     } else {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         $client->quit("Read error: $!");
@@ -547,7 +563,7 @@ sub run_piped {
     my ($in, @pids);
 
     for my $do (@_) {
-        my ($args, $dir) = @$do;
+        my ($args, $dir, $umask) = @$do;
         my $command = shift @$args || croak "No command";
         pipe(my $rd, my $wr) || die "Could not pipe(): $!\n";
         my $pid = fork() // die "Could not fork: $!\n";
@@ -562,6 +578,7 @@ sub run_piped {
                 open(STDOUT, ">&", $wr) || die "Could not dup to STDOUT: $!";
                 close($wr);
                 !defined $dir || chdir($dir) || die "Could not chdir($dir): $!";
+                umask($umask) if defined $umask;
                 exec($command, @$args) || die "Could not exec $command: $!";
             };
             my $err = $@;
@@ -609,6 +626,62 @@ sub git_dir {
     $out =~ s/\n\z//  || die "Unexpected rev-parse output '$out'";
     $out =~ /^(.+)\z/ || die "Unexpected rev-parse output '$out'";
     return $1;
+}
+
+sub client_response_parse {
+    my ($fh) = @_;
+
+    my $response = "";
+    my $code;
+    local $_;
+    while (1) {
+        $_ = <$fh>;
+        defined || die "Git-ExportDaemon closed the connection\n";
+        s/\s+\z//;
+        s/^([0-9]{3})([- ])// ||
+            die "Invalid response from Git-ExportDaemon: $_\n";
+        $code //= $1;
+        $code eq $1 || die "Inconsistent response code from Git-ExportDaemon\n";
+        $response .= "$_\n";
+        last if $2 eq " ";
+    }
+    $response =~ s/\s+\z//;
+    return $code, $response;
+}
+
+sub client_git_export {
+    my ($repo, %params) = @_;
+
+    $repo // croak "Assertion: No repository argument";
+    $repo = escape(cwd_path($repo));
+    my $socket =
+        delete $params{socket} //
+        "/run/user/$>/Git-ExportDaemon/" . NAME_SOCKET;
+    my $commit = escape(delete $params{commit} // "HEAD");
+    my $quit      = delete $params{quit} // 1;
+    my $quit_wait = delete $params{quit_wait};
+
+    my $fh = IO::Socket::UNIX->new(Peer => $socket) ||
+        die "Could not connect to '$socket': $!";
+    my ($code, $response) = client_response_parse($fh);
+    $code == CODE_GREETING ||
+        die "Unexpected greeting from Git-ExportDaemon: $code $response\n";
+    print($fh "export $repo $commit\n") ||
+        die "Error writing to Git-ExportDaemon: $!\n";
+    ($code, $response) = client_response_parse($fh);
+    $code == CODE_EXPORTED ||
+        die "Unexpected export response from Git-ExportDaemon: $code $response\n";
+    !$quit || print($fh "quit\n") ||
+        die "Error writing to Git-ExportDaemon: $!\n";
+    my ($revision, $path) = $response =~ /^([0-9a-f]{40})\s+(\S+)\z/ or
+        die "Could not parse export response from Git-ExportDaemon: $response\n";
+    if ($quit && $quit_wait) {
+        ($code, $response) = client_response_parse($fh);
+        $code == CODE_QUIT ||
+            die "Unexpected quit response from Git-ExportDaemon: $code $response\n";
+    }
+    close($fh);
+    return $revision, unescape($path);
 }
 
 1;
