@@ -34,7 +34,7 @@ use Git::ExportDaemon qw
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
      MODE NAME_SOCKET
      is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
-     run_piped escape unescape lock_file cwd_path dir_rw dir_ro);
+     run_piped escape unescape lock_file cwd_path dir_rw dir_ro trust_check);
 
 use constant {
     NAME_STATE	=> "state",
@@ -88,7 +88,7 @@ sub state_read_uid {
 
     # If these fail the caller will kill the whole uid
     eval { dir_rw($dir_state ) } || return;
-    eval { dir_rw($dir_export) } || return;
+    eval { dir_rw($dir_export, 0700) } || return;
 
     opendir(my $dh, $dir_state) || die "Could not opendir '$dir_state': $!";
     for my $f (readdir($dh)) {
@@ -186,7 +186,7 @@ sub state_read {
             my ($uid) = $f =~ /^([1-9][0-9]*|0)\z/ or next;
             my $path = "$dir/$uid";
 
-            if (!dir_rw($path, 0700)) {
+            if (!dir_rw($path)) {
                 # Not a directory!
                 report("warning", "User area $path is not in fact a directory");
                 unlink($path) || $! == ENOENT || $! == ESTALE ||
@@ -232,7 +232,7 @@ sub register {
 
     my $dir_uid = PATH_BASE . "/$uid";
     # Don't check return, the open will implicitely report any problems
-    mkdir($dir_uid, 0700);
+    mkdir($dir_uid);
     my $dir_state = "$dir_uid/" . NAME_STATE;
     # Don't check return, the open will implicitely report any problems
     mkdir($dir_state);
@@ -315,7 +315,7 @@ sub export {
     } else {
         report("info", "Git exporting $commit as $path_export");
         # Don't check return of mkdir. The rename will implicitely check it
-        mkdir($dir_export);
+        mkdir($dir_export, 0700);
         my ($id, $stage_path) = stage_tmp();
         my $out = run_piped(
             [["git", "archive", "--prefix=$id/", $revision], $repo],
@@ -397,10 +397,8 @@ eval {
     report_start();
     report("info", "Running as pid $$");
 
-    if (! eval { dir_rw(PATH_BASE) }) {
-        mkdirs(PATH_BASE);
-        dir_rw(PATH_BASE);
-    }
+    trust_check(PATH_BASE);
+    dir_rw(PATH_BASE);
     $lock = lock_file(cwd_path(LOCK_PATH));
 
     my $fh = is_systemd();

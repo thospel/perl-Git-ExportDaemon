@@ -26,6 +26,8 @@ use constant {
     DEV				=> 0,
     INO				=> 1,
     MODE			=> 2,
+    UID				=> 4,
+    GID				=> 5,
     MTIME			=> 9,
 
     NAME_SOCKET			=> "S.git-exportd",
@@ -50,10 +52,10 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     NAME_SOCKET DEV INO MODE
+     NAME_SOCKET DEV INO MODE UID GID
      client_git_export client_response_parse git_rev_parse git_ls_remote git_dir
      run_piped is_systemd mkdirs rmtree permtree cwd_path lock_file blocking
-     dir_ro dir_rw report report_start escape unescape);
+     dir_ro dir_rw report report_start escape unescape trust_check);
 
 sub report_start {
     my $ident    = shift // $Script;
@@ -420,7 +422,7 @@ sub listener {
     $all_listeners{$fd} = $fh;
 }
 
-# Return full path
+# Return full path WITHOUT normalizing
 sub cwd_path {
     my ($path) = @_;
 
@@ -492,8 +494,99 @@ sub mkdirs {
     }
 }
 
+sub _trust_check {
+    my ($path, $trust_cache) = @_;
+print STDERR "trust $path\n";
+
+    $path =~ m{^/} ||
+        croak "Assertion: _trust_check argument '$path' must be absolute";
+    $path =~ m{^//(?:[^/]|\z)} &&
+        croak "Paths starting with // are not supported";
+    $path =~ /\0/ && croak "Path contains \\0";
+    # Make sure path ends on /
+    $path .= "/";
+    # Collapse multiple /
+    $path =~ tr{/}{}s;
+    # . path component does nothing
+    1 while $path =~ s{/\./}{/}g;
+    # Remove leading / for processing
+    $path =~ s{^/}{};
+
+    # nominal will never end on /, real always will
+    # This is because we want to do a (l)stat on nominal which should not follow
+    # symlinks on the final component
+    my $nominal = "";
+    my $real    = "/";
+
+    while ($path =~ s{^([^/]+)/}{}) {
+        my $name = $1;
+        my $nominal_old = $nominal;
+        $nominal .= "/$name";
+        if (exists $trust_cache->{$nominal}) {
+            $real = $trust_cache->{$nominal} // croak "Path lookup loop";
+            next;
+        }
+        if ($name eq "..") {
+            # .. on / will reamin /
+            $real =~ s{[^/]+/}{};
+        } else {
+            my @lstat = lstat($nominal) or die "Could not lstat($nominal): $!";
+            if (-d _) {
+                my $mode = $lstat[MODE] & 07777;
+                ($mode & 02)  == 0 || croak "'$nominal' is world writable";
+                ($mode & 020) == 0 || $lstat[GID] == 0 ||
+                    croak "'$nominal' is group writable by someone other than root/wheel";
+                ($mode & 0200) == 0 || $lstat[UID] == 0 || $lstat[UID] == $> ||
+                    croak "'$nominal' is user writable by someone other than root or me";
+                $real .= "$name/";
+            } elsif (-l _) {
+                # Permissions on symlinks are irrelevant
+                my $link = readlink($nominal) //
+                    croak "Could not readlink($nominal): $!";
+                $trust_cache->{$nominal} = undef;
+                if ($link =~ m{^/}) {
+                    # Absolute path
+                    $real = _trust_check($link);
+                } else {
+                    $real = _trust_check("$nominal_old/$link");
+                }
+            } else {
+                croak "Path '$nominal' is not a directory or symlink";
+            }
+        }
+        $trust_cache->{$nominal} = $real;
+    }
+    $path eq "" || croak "Assertion: Path left is not empty: '$path'";
+    return $real;
+}
+
+sub trust_check {
+    my ($path) = @_;
+
+    # Sanity check on /
+    my @lstat = lstat("/") or croak "Assertion: Cannot lstat(/): $!";
+    -d _ || croak "Assertion: / is not a directory";
+    my $mode = $lstat[MODE] & 07777;
+    ($mode & 02)  == 0 || croak "/ is world writable";
+    ($mode & 020) == 0 || $lstat[GID] == 0 ||
+        croak "/ is group writable by someone other than root/wheel";
+    ($mode & 0200) == 0 || $lstat[UID] == 0 ||
+        croak "/ is user writable by someone other than root";
+
+    $path = cwd_path($path);
+    return _trust_check($path, {});
+}
+
+# You *MUST* trust all levels leading to path or this can be used to remove
+# arbitrary paths. However no trust of path and what it contains is needed
+# git-exportd indeed checks that the path upto BASE is trusted (see trust_check)
 sub rmtree {
     my ($path, %params) = @_;
+
+    if (!$params{silent}) {
+        report("info", "removing $path");
+        $params{silent} = 1;
+    }
 
     # lstat so we don't follow symlinks
     my @lstat = lstat($path) or do {
@@ -501,11 +594,16 @@ sub rmtree {
         die "Could not lstat($path): $!";
     };
     my $mode = $lstat[MODE] & 07777;
-    if (!$params{silent}) {
-        report("info", "removing $path");
-        $params{silent} = 1;
-    }
     if (-d _) {
+        if ($lstat[UID] != $> || $lstat[GID] != $)) {
+            chown($>, $), $path) || die "Could not chown($path): $!";
+            @lstat = lstat($path) or die "Could not lstat($path): $!";
+            $mode = $lstat[MODE] & 07777;
+            # Sanity check, no more
+            # If the lower levels aren't secure this will not save you
+            $lstat[UID] == $> || croak "Assertion: chown uid was ineffective";
+            $lstat[GID] == $) || croak "Assertion: chown gid was ineffective";
+        }
         # Directory must be writable to be able to remove things from it
         # Directory must be executable to access it
         # Directory must be readable to list it
@@ -730,8 +828,8 @@ sub client_git_export {
     $repo = escape(cwd_path($repo));
     my $socket =
         delete $params{socket} //
-        "/run/user/$>/Git-ExportDaemon/" . NAME_SOCKET;
-    my $commit = escape(delete $params{commit} // "HEAD");
+        ($ENV{XDG_RUNTIME_DIR} || "/run/user/$>") . "/Git-ExportDaemon/" . NAME_SOCKET;
+    my $commit    = escape(delete $params{commit} // "HEAD");
     my $quit      = delete $params{quit} // 1;
     my $quit_wait = delete $params{quit_wait};
 
