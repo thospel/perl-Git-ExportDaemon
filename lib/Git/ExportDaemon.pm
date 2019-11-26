@@ -11,7 +11,7 @@ use Cwd;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EEXIST ESTALE ENOENT EDOM EACCES);
 use POSIX qw(F_GETFL F_SETFL O_NONBLOCK _exit);
 use Fcntl qw
-    (O_RDWR O_CREAT LOCK_EX LOCK_NB S_IFMT S_IFLNK);
+    (O_RDWR O_CREAT LOCK_EX LOCK_NB S_ISLNK S_ISDIR);
 use Socket qw(SO_PEERCRED SOL_SOCKET);
 use Sys::Syslog;
 use IO::Socket::UNIX;
@@ -45,6 +45,7 @@ use constant {
     CODE_UNKNOWN_REVISION	=> 506,
     CODE_GIT_ERROR		=> 507,
     CODE_INVALID_REPO		=> 508,
+    CODE_PERMISSION_DENIED	=> 509,
 };
 
 require Exporter;
@@ -52,8 +53,8 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     NAME_SOCKET DEV INO MODE UID GID
-     client_git_export client_response_parse git_rev_parse git_ls_remote git_dir
+     CODE_PERMISSION_DENIED NAME_SOCKET DEV INO MODE UID GID S_ISLNK S_ISDIR
+     client_git_export client_response_parse git_rev_parse git git_dir path_stat
      run_piped is_systemd mkdirs rmtree permtree cwd_path lock_file blocking
      dir_ro dir_rw report report_start escape unescape trust_check);
 
@@ -377,7 +378,7 @@ sub acceptable {
     }, $class;
     $all_clients{$client->id} = $client;
     $class->add_read($fh, sub { $client->can_read() });
-    if ($uid != $> && $uid != 0) {
+    if ($uid != $> && $> != 0) {
         my $me = getpwuid($>) || "$>";
         my $user = $client->user;
         $client->finish(CODE_INVALID_USER,
@@ -501,8 +502,8 @@ print STDERR "trust $path\n";
     $path =~ m{^/} ||
         croak "Assertion: _trust_check argument '$path' must be absolute";
     $path =~ m{^//(?:[^/]|\z)} &&
-        croak "Paths starting with // are not supported";
-    $path =~ /\0/ && croak "Path contains \\0";
+        die "Paths starting with // are not supported\n";
+    $path =~ /\0/ && die "Path contains \\0\n";
     # Make sure path ends on /
     $path .= "/";
     # Collapse multiple /
@@ -523,7 +524,7 @@ print STDERR "trust $path\n";
         my $nominal_old = $nominal;
         $nominal .= "/$name";
         if (exists $trust_cache->{$nominal}) {
-            $real = $trust_cache->{$nominal} // croak "Path lookup loop";
+            $real = $trust_cache->{$nominal} // die "Path lookup loop\n";
             next;
         }
         if ($name eq "..") {
@@ -533,11 +534,11 @@ print STDERR "trust $path\n";
             my @lstat = lstat($nominal) or die "Could not lstat($nominal): $!";
             if (-d _) {
                 my $mode = $lstat[MODE] & 07777;
-                ($mode & 02)  == 0 || croak "'$nominal' is world writable";
+                ($mode & 02)  == 0 || die "'$nominal' is world writable\n";
                 ($mode & 020) == 0 || $lstat[GID] == 0 ||
-                    croak "'$nominal' is group writable by someone other than root/wheel";
+                    die "'$nominal' is group writable by someone other than root/wheel\n";
                 ($mode & 0200) == 0 || $lstat[UID] == 0 || $lstat[UID] == $> ||
-                    croak "'$nominal' is user writable by someone other than root or me";
+                    die "'$nominal' is user writable by someone other than root or me\n";
                 $real .= "$name/";
             } elsif (-l _) {
                 # Permissions on symlinks are irrelevant
@@ -551,7 +552,7 @@ print STDERR "trust $path\n";
                     $real = _trust_check("$nominal_old/$link");
                 }
             } else {
-                croak "Path '$nominal' is not a directory or symlink";
+                die "Path '$nominal' is not a directory or symlink\n";
             }
         }
         $trust_cache->{$nominal} = $real;
@@ -567,11 +568,11 @@ sub trust_check {
     my @lstat = lstat("/") or croak "Assertion: Cannot lstat(/): $!";
     -d _ || croak "Assertion: / is not a directory";
     my $mode = $lstat[MODE] & 07777;
-    ($mode & 02)  == 0 || croak "/ is world writable";
+    ($mode & 02)  == 0 || die "/ is world writable\n";
     ($mode & 020) == 0 || $lstat[GID] == 0 ||
-        croak "/ is group writable by someone other than root/wheel";
+        die "/ is group writable by someone other than root/wheel\n";
     ($mode & 0200) == 0 || $lstat[UID] == 0 ||
-        croak "/ is user writable by someone other than root";
+        die "/ is user writable by someone other than root\n";
 
     $path = cwd_path($path);
     return _trust_check($path, {});
@@ -652,7 +653,7 @@ sub permtree {
         return if $top_keep;
     }
     my $mode_new = $mode & $allow;
-    $mode == $mode_new || S_IFMT($lstat[MODE]) == S_IFLNK ||
+    $mode == $mode_new || S_ISLNK($lstat[MODE]) ||
         chmod($mode_new, $path) || die "Could not chmod($path): $!";
 }
 
@@ -689,29 +690,6 @@ sub dir_ro {
     return 1;
 }
 
-sub run {
-    my ($args, $dir) = @_;
-    my $command = shift @$args || croak "No command";
-
-    my $pid = open(my $fh, "-|") // die "Could not fork: $!";
-    if ($pid == 0) {
-        $SIG{PIPE} = "DEFAULT";
-        # Child. Avoid being caught by parent
-        eval {
-            !defined $dir || chdir($dir) || die "Could not chdir($dir): $!";
-            exec($command, @$args) || die "Could not exec $command: $!";
-        };
-        my $err = $@;
-        $err =~ s/\s+\z//;
-        eval { report("err", "Child $command: $err") };
-        _exit(1);
-    }
-    my $out = do { local $/; <$fh> };
-    close($fh);
-    return undef if $?;
-    return $out;
-}
-
 sub escape {
     my ($str) = @_;
     for ($str) {
@@ -731,11 +709,37 @@ sub unescape {
     return $str;
 }
 
+sub set_uidgid {
+    my ($uid, $gid) = @_;
+
+    if (defined $uid) {
+        if (my @user_props = getpwuid($uid)) {
+            $ENV{HOME}    = $user_props[7];
+            $ENV{SHELL}   = $user_props[8];
+            $ENV{LOGNAME} = $ENV{USER} = $user_props[0];
+        } else {
+            delete @ENV{qw(HOME LOGNAME USER)};
+            $ENV{SHELL} = "/bin/sh";
+        }
+    }
+
+    # Assign real first, effective second
+    $) = $( = $gid if defined $gid;
+    $> = $< = $uid if defined $uid;
+    # The saved uid/gid may not be set, but we'll do an exec() immediately
+    # afterward and that will copy from the effective uid
+
+    # Check
+    !defined $gid || $) == $gid && $( == $gid || die "Could not set gid";
+    !defined $uid || $> == $uid && $< == $uid || die "Could not set uid";
+}
+
 sub run_piped {
     my ($in, @pids);
 
     for my $do (@_) {
-        my ($args, $dir, $umask) = @$do;
+        my ($args, $dir, $umask, $uid, $gid) =
+            @$do{qw(command dir umask uid gid)};
         my $command = shift @$args || croak "No command";
         pipe(my $rd, my $wr) || die "Could not pipe(): $!\n";
         my $pid = fork() // die "Could not fork: $!\n";
@@ -749,9 +753,22 @@ sub run_piped {
                 }
                 open(STDOUT, ">&", $wr) || die "Could not dup to STDOUT: $!";
                 close($wr);
-                !defined $dir || chdir($dir) || die "Could not chdir($dir): $!";
                 umask($umask) if defined $umask;
-                exec($command, @$args) || die "Could not exec $command: $!";
+                set_uidgid($uid, $gid);
+                if ($command eq "\0stat") {
+                    defined $dir || die "No directory argument\n";
+                    select(STDOUT);
+                    $| = 1;
+                    if (my @stat = stat($dir)) {
+                        print "0 @stat\n";
+                    } else {
+                        print $!+0, "\n";
+                    }
+                    _exit(0);
+                } else {
+                    !defined $dir || chdir($dir) || die "Could not chdir($dir): $!";
+                    exec($command, @$args) || die "Could not exec $command: $!";
+            }
             };
             my $err = $@;
             $err =~ s/\s+\z//;
@@ -773,31 +790,47 @@ sub run_piped {
     return $out;
 }
 
-sub git_ls_remote {
-    my ($repo, $commit) = @_;
-
-    my $out = run(["git", "ls-remote", $repo, $commit]) // return undef;
-    $out =~ s/\s+\z//;
-    $out =~ /^([0-9a-f]{40})\s.+\z/ || die "Unexpected ls-remote output '$out'";
-    return $1;
+sub run {
+    return run_piped({@_});
 }
 
 sub git_rev_parse {
-    my ($repo, $commit) = @_;
+    my ($repo, $commit, $uid, $gid) = @_;
 
-    my $out = run(["git", "rev-parse", $commit], $repo) // return undef;
+    my $out = run(command => ["git", "rev-parse", $commit],
+                  dir => $repo,
+                  uid => $uid,
+                  gid => $gid) // return undef;
     $out =~ s/\s+\z//;
     $out =~ /^([0-9a-f]{40})\z/ || die "Unexpected rev-parse output '$out'";
     return $1;
 }
 
 sub git_dir {
-    my ($repo) = @_;
+    my ($repo, $uid, $gid) = @_;
 
-    my $out = run(["git", "rev-parse", "--git-dir"], $repo) // return undef;
+    my $out = run(command => ["git", "rev-parse", "--git-dir"],
+                  dir => $repo,
+                  uid => $uid,
+                  gid => $gid) // return undef;
     $out =~ s/\n\z//  || die "Unexpected rev-parse output '$out'";
     $out =~ /^(.+)\z/ || die "Unexpected rev-parse output '$out'";
     return $1;
+}
+
+sub path_stat {
+    my ($path, $uid, $gid) = @_;
+
+    my $out = run(command => ["\0stat"],
+                  dir => $path,
+                  uid => $uid,
+                  gid => $gid) // return undef;
+    $out =~ /^((?:\d+)(?:\s+\d+)*)\n\z/ ||
+        croak "Assertion: Unexpected stat output '$out'";
+    my ($err, @stat) = split " ", $out;
+    # Convert back to dualvar
+    $err = $! = $err;
+    return $err, \@stat;
 }
 
 sub client_response_parse {

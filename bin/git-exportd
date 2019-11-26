@@ -32,9 +32,10 @@ use constant {
 use Git::ExportDaemon qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     MODE NAME_SOCKET
+     CODE_PERMISSION_DENIED MODE NAME_SOCKET S_ISDIR
      is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
-     run_piped escape unescape lock_file cwd_path dir_rw dir_ro trust_check);
+     path_stat run_piped escape unescape lock_file cwd_path dir_rw dir_ro
+     trust_check);
 
 use constant {
     NAME_STATE	=> "state",
@@ -67,7 +68,8 @@ my $umask = 022;
             report("info", "removing $path");
             my $stage = stage_tmp();
             # Make writable if directory so we can move it
-            dir_rw($path);
+            # But as root we don't need to and want to avoid symlink attacks
+            dir_rw($path) if $>;
             rename($path, $stage) || die "Could not rename '$path' to '$stage': $!";
         }
     }
@@ -87,7 +89,7 @@ sub state_read_uid {
     my $dir_export = "$dir/" . NAME_EXPORT;
 
     # If these fail the caller will kill the whole uid
-    eval { dir_rw($dir_state ) } || return;
+    eval { dir_rw($dir_state , 0700) } || return;
     eval { dir_rw($dir_export, 0700) } || return;
 
     opendir(my $dh, $dir_state) || die "Could not opendir '$dir_state': $!";
@@ -184,17 +186,17 @@ sub state_read {
                 next;
             }
             my ($uid) = $f =~ /^([1-9][0-9]*|0)\z/ or next;
-            my $path = "$dir/$uid";
+            my $path_uid = "$dir/$uid";
 
-            if (!dir_rw($path)) {
+            if (!dir_rw($path_uid)) {
                 # Not a directory!
-                report("warning", "User area $path is not in fact a directory");
-                unlink($path) || $! == ENOENT || $! == ESTALE ||
-                    die "Could not unlink($path): $!";
+                report("warning", "User area $path_uid is not in fact a directory");
+                unlink($path_uid) || $! == ENOENT || $! == ESTALE ||
+                    die "Could not unlink($path_uid): $!";
                 next;
             }
 
-            state_read_uid($path,
+            state_read_uid($path_uid,
                            $uid_revision_pid->{$uid} ||= {},
                            $uid_pid_revision->{$uid} ||= {});
             if (%{$uid_revision_pid->{$uid}}) {
@@ -205,7 +207,7 @@ sub state_read {
                 # But if so you may need to fixup export and state since
                 # state_read_uid currently doesn't bother if it knows uid will
                 # get cleaned up
-                stage_delete($path);
+                stage_delete($path_uid);
                 %{$uid_pid_revision->{$uid}} &&
                     die "Assertion: Inconsistent pid/revision state";
                 delete $uid_revision_pid->{$uid};
@@ -235,7 +237,7 @@ sub register {
     mkdir($dir_uid);
     my $dir_state = "$dir_uid/" . NAME_STATE;
     # Don't check return, the open will implicitely report any problems
-    mkdir($dir_state);
+    mkdir($dir_state, 0700);
 
     my $file = "$dir_state/$revision";
     open(my $fh, ">>", $file) || die "Could not open '$file' for append: $!";
@@ -291,20 +293,23 @@ sub export {
     my ($client, $repo, $commit) = @_;
 
     my $uid = $client->uid;
+    my $gid = $client->gid;
+
     my $dir_export = PATH_BASE . "/$uid/" . NAME_EXPORT;
-    if (!-d $repo) {
-        if (-e _) {
-            $client->output(CODE_INVALID_REPO, "Repository is not a directory");
-        } else {
-            $client->output(CODE_INVALID_REPO, "Repository does not exist");
-        }
+    my ($err, $stat) = path_stat($repo, $uid, $gid);
+    if ($err) {
+        $client->output(CODE_INVALID_REPO, "Cannot access Repository: $err");
+        return;
+    } elsif (!S_ISDIR($stat->[MODE])) {
+        $client->output(CODE_INVALID_REPO, "Repository is not a directory");
         return;
     }
-    if (!defined git_dir($repo)) {
+
+    if (!defined git_dir($repo, $uid, $gid)) {
         $client->output(CODE_INVALID_REPO, "Directory '$repo' is not a repository");
         return;
     }
-    my $revision = git_rev_parse($repo, $commit) // do {
+    my $revision = git_rev_parse($repo, $commit, $uid, $gid) // do {
         $client->output(CODE_UNKNOWN_REVISION, "Unknown revision $commit");
         return;
     };
@@ -314,26 +319,37 @@ sub export {
         report("info", "Already have $commit exported as $path_export");
     } else {
         report("info", "Git exporting $commit as $path_export");
-        # Don't check return of mkdir. The rename will implicitely check it
-        mkdir($dir_export, 0700);
+        # Don't error on failing of mkdir. The rename will implicitely check it
+        if (mkdir($dir_export, 0700)) {
+            chown($uid, $gid, $dir_export) ||
+                die "Could not chown($uid:$gid, $dir_export): $!";
+        }
         my ($id, $stage_path) = stage_tmp();
         my $out = run_piped(
-            [["git", "archive", "--prefix=$id/", $revision], $repo],
-            [["tar", "--no-same-permissions", "-x"], PATH_STAGE]);
+            {
+                command => ["git", "archive", "--prefix=$id/", $revision],
+                dir     => $repo,
+                uid	=> $uid,
+                gid	=> $gid,
+            }, {
+                command => ["tar", "--no-same-permissions", "-x"],
+                dir     => PATH_STAGE,
+            });
         if (!defined $out) {
             stage_clean();
             $client->output(CODE_GIT_ERROR, "Git error");
             return;
         }
         # Allow r-x, but preserve the top level directory or we cannot rename
-        permtree($stage_path, 0555, top_keep => 1);
+        # Not needed as root (no symlink attacks due to trusted target dir)
+        permtree($stage_path, 0555, top_keep => 1) if $>;
         rename($stage_path, $path_export) || do {
             my $err = $!;
             stage_clean();
             die "Could not rename '$stage_path' to '$path_export': $err";
         };
         unstage_tmp();
-        dir_ro($path_export);
+        dir_ro($path_export) if $>;
     }
     my $escaped = escape(cwd_path($path_export));
     $client->output(CODE_EXPORTED, "$revision $escaped");
@@ -372,6 +388,11 @@ EOT
     } elsif ($command eq "QUIT") {
         $client->finish(CODE_QUIT, "Manual quit", "Goodbye");
     } elsif ($command eq "SHUTDOWN") {
+        if ($client->uid != $> && $client->uid != 0) {
+            my $user = $client->user;
+            $client->output(CODE_PERMISSION_DENIED, "User '$user' is not allowed to shutdown");
+            return;
+        }
         Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
         # Cleanup before shutdown
         state_read();
