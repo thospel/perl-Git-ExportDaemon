@@ -5,7 +5,7 @@ use warnings;
 use FindBin qw($Script $Bin);
 
 # If the program runs as /foobar/bin/program, find libraries in /foobar/lib
-my ($base, %state, %pids, $private_socket);
+my ($base, %uid_revision_pid, %uid_pid_revision, $private_socket);
 BEGIN {
     # Even on windows FindBin uses / in the reported path
     $Bin = $FindBin::Bin;
@@ -32,13 +32,13 @@ use constant {
 use Git::ExportDaemon qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
      CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     NAME_SOCKET
+     MODE NAME_SOCKET
      is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
      run_piped escape unescape lock_file cwd_path dir_rw dir_ro);
 
 use constant {
-    PATH_STATE	=> PATH_BASE . "/state",
-    PATH_EXPORT	=> PATH_BASE . "/export",
+    NAME_STATE	=> "state",
+    NAME_EXPORT	=> "export",
     PATH_STAGE	=> PATH_BASE . "/stage",
     PATH_SOCKET	=> PATH_BASE . "/" . NAME_SOCKET,
     LOCK_PATH	=> PATH_BASE . "/git-exportd.lock",
@@ -47,123 +47,202 @@ use constant {
 my $umask = 022;
 
 {
+    my $to_delete = 0;
     my $stage_id = "A";
     sub stage_tmp {
         my $id = $stage_id++;
         # Gives just the fresh path in scalar context
         return $id, PATH_STAGE . "/$id";
+        # Supposedly something will be placed in stage. Mark it for cleanup
+        # Call unstage_tmp if you remove it from stage again
+        ++$to_delete;
+    }
+
+    sub unstage_tmp {
+        --$to_delete;
+    }
+
+    sub stage_delete {
+        for my $path (@_) {
+            report("info", "removing $path");
+            my $stage = stage_tmp();
+            # Make writable if directory so we can move it
+            dir_rw($path);
+            rename($path, $stage) || die "Could not rename '$path' to '$stage': $!";
+        }
+    }
+
+    sub stage_clean {
+        $to_delete || return;
+        rmtree(PATH_STAGE, top_keep => 1, silent => 1);
+        $to_delete = 0;
     }
 }
 
-sub stage_delete {
-    for my $path (@_) {
-        report("info", "removing $path");
-        my $stage = stage_tmp();
-        # Make writable if directory so we can move it
-        dir_rw($path);
-        rename($path, $stage) || die "Could not rename '$path' to '$stage': $!";
-    }
-}
+# Caller is responsible for first doing dir_rw($dir)
+sub state_read_uid {
+    my ($dir, $revision_pid, $pid_revision) = @_;
 
-sub stage_clean {
-    rmtree(PATH_STAGE, top_keep => 1, silent => 1);
-}
+    my $dir_state  = "$dir/" . NAME_STATE;
+    my $dir_export = "$dir/" . NAME_EXPORT;
 
-sub state_read {
-    %state = ();
-    %pids = ();
+    # If these fail the caller will kill the whole uid
+    eval { dir_rw($dir_state ) } || return;
+    eval { dir_rw($dir_export) } || return;
 
-    my $dir = PATH_STATE;
-    opendir(my $dh, $dir) || die "Could not opendir '$dir': $!";
+    opendir(my $dh, $dir_state) || die "Could not opendir '$dir_state': $!";
     for my $f (readdir($dh)) {
         next if $f eq "." || $f eq "..";
-        my $path = "$dir/$f";
+        my $path_state = "$dir_state/$f";
         if (my ($revision) = $f =~ /^([0-9a-f]{40})\z/) {
-            my $exp_path = PATH_EXPORT . "/$f";
-            lstat($exp_path) || $! == ENOENT || $! == ESTALE ||
-                die "Could not lstat($exp_path): $!";
+            my $path_export = "$dir_export/$f";
+            lstat($path_export) || $! == ENOENT || $! == ESTALE ||
+                die "Could not lstat($path_export): $!";
             if (-d _) {
-                open(my $fh, "<", $path) || die "Could not open '$path': $!";
+                open(my $fh, "<", $path_state) || die "Could not open '$path_state': $!";
                 local $_;
                 while (<$fh>) {
                     my ($pid) = /^(\d+)\n/ or do {
-                        report("warning", "State file '$path' is damaged");
+                        report("warning", "State file '$path_state' is damaged");
                         last;
                     };
-                    $state{$revision}{$pid} ||= 1;
-                    $pids{$pid}{$revision} ||= 1;
+                    $revision_pid->{$revision}{$pid} ||= 1;
+                    $pid_revision->{$pid}{$revision} ||= 1;
                 }
                 next;
             }
         }
-        rmtree($path);
+        rmtree($path_state);
     }
-    closedir($dh) || die "Could not closedir '$dir': $!";
+    closedir($dh) || die "Could not closedir '$dir_state': $!";
 
     # Check if any pids are gone
     my %update;
-    while (my ($pid, $revisions) = each %pids) {
+    while (my ($pid, $revisions) = each %$pid_revision) {
         next if kill(0, $pid) && $pid != $$ && $pid > 1;
-        delete $pids{$pid};
+        delete $pid_revision->{$pid};
         my @revisions = keys %$revisions;
         @update{@revisions} = ();
         for my $revision (@revisions) {
-            delete $state{$revision}{$pid};
+            delete $revision_pid->{$revision}{$pid};
         }
+    }
+
+    if (!%$pid_revision) {
+        report("info", "Fast delete of $dir");
+        %$revision_pid = ();
+        # stage_delete currently unneeded
+        # (caller will kill containing directory)
+        # stage_delete($dir_state);
+        # stage_delete($dir_export);
+        return;
     }
 
     # Rewrite the state file for any pids that are gone
     for my $revision (keys %update) {
-        my $path = "$dir/$revision";
-        my @pids = sort { $a <=> $b } keys %{$state{$revision}};
+        my $path_state = "$dir_state/$revision";
+        my @pids = sort { $a <=> $b } keys %{$revision_pid->{$revision}};
         if (@pids) {
             my $tmp = stage_tmp();
             open(my $fh, ">>", $tmp) ||
                 die "Could not append to '$tmp': $!";
-            eval {
-                print($fh map "$_\n", @pids) ||
-                    die "Could not write to '$tmp': $!";
-                close($fh) || die "Could not close '$tmp': $!";
-                rename($tmp, $path) ||
-                    die "Could not rename '$tmp' to '$path': $!";
-            };
-            if (my $err = $@) {
-                stage_clean();
-                die $err;
-            }
+            print($fh map "$_\n", @pids) ||
+                die "Could not write to '$tmp': $!";
+            close($fh) || die "Could not close '$tmp': $!";
+            rename($tmp, $path_state) ||
+                die "Could not rename '$tmp' to '$path_state': $!";
+            unstage_tmp();
         } else {
-            delete $state{$revision};
-            rmtree($path);
+            delete $revision_pid->{$revision};
+            rmtree($path_state);
         }
     }
 
     # Clean up any exports we don't know about
-    my $exp_dir = PATH_EXPORT;
-    opendir($dh, $exp_dir) || die "Could not opendir '$exp_dir': $!";
-    my $delete;
+    opendir($dh, $dir_export) || die "Could not opendir '$dir_export': $!";
     for my $f (readdir($dh)) {
         next if $f eq "." || $f eq "..";
-        my $path = "$exp_dir/$f";
-        next if exists $state{$f};
-        $delete ||= 1;
-        stage_delete($path);
+        my $path_export = "$dir_export/$f";
+        next if exists $revision_pid->{$f};
+        stage_delete($path_export);
     }
-    stage_clean() if $delete;
 
-    closedir($dh) || die "Could not closedir '$exp_dir': $!";
+    closedir($dh) || die "Could not closedir '$dir_export': $!";
+}
+
+sub state_read {
+    my $uid_revision_pid = {};
+    my $uid_pid_revision = {};
+
+    my $dir = PATH_BASE;
+    eval {
+        opendir(my $dh, $dir) || die "Could not opendir '$dir': $!";
+        for my $f (readdir($dh)) {
+            if ($f eq NAME_EXPORT || $f eq NAME_STATE) {
+                # Cleanup directories at the wrong level
+                stage_delete("$dir/$f");
+                next;
+            }
+            my ($uid) = $f =~ /^([1-9][0-9]*|0)\z/ or next;
+            my $path = "$dir/$uid";
+
+            if (!dir_rw($path, 0700)) {
+                # Not a directory!
+                report("warning", "User area $path is not in fact a directory");
+                unlink($path) || $! == ENOENT || $! == ESTALE ||
+                    die "Could not unlink($path): $!";
+                next;
+            }
+
+            state_read_uid($path,
+                           $uid_revision_pid->{$uid} ||= {},
+                           $uid_pid_revision->{$uid} ||= {});
+            if (%{$uid_revision_pid->{$uid}}) {
+                %{$uid_pid_revision->{$uid}} ||
+                    die "Assertion: Inconsistent pid/revision state";
+            } else {
+                # Possibly keep this dir for caching
+                # But if so you may need to fixup export and state since
+                # state_read_uid currently doesn't bother if it knows uid will
+                # get cleaned up
+                stage_delete($path);
+                %{$uid_pid_revision->{$uid}} &&
+                    die "Assertion: Inconsistent pid/revision state";
+                delete $uid_revision_pid->{$uid};
+                delete $uid_pid_revision->{$uid};
+            }
+        }
+        %uid_revision_pid = %$uid_revision_pid;
+        %uid_pid_revision = %$uid_pid_revision;
+    };
+    my $err = $@;
+    stage_clean();
+    die $err if $err;
 }
 
 sub register {
-    my ($revision, $pid) = @_;
+    my ($uid, $pid, $revision) = @_;
 
-    return if exists $state{$revision} && $state{$revision}{$pid};
+    # Avoid autovivify to keep the datastructure consistent even if the file
+    # write fails
+    return if
+        exists $uid_revision_pid{$uid} &&
+        exists $uid_revision_pid{$uid}{$revision} &&
+        $uid_revision_pid{$uid}{$revision}{$pid};
 
-    my $file = PATH_STATE . "/$revision";
+    my $dir_uid = PATH_BASE . "/$uid";
+    # Don't check return, the open will implicitely report any problems
+    mkdir($dir_uid, 0700);
+    my $dir_state = "$dir_uid/" . NAME_STATE;
+    # Don't check return, the open will implicitely report any problems
+    mkdir($dir_state);
+
+    my $file = "$dir_state/$revision";
     open(my $fh, ">>", $file) || die "Could not open '$file' for append: $!";
     print($fh "$pid\n") || die "Could not write to '$file': $!";
     close($fh) || die "Error closing '$file': $!";
-    $state{$revision}{$pid} ||= 1;
-    $pids{$pid}{$revision}  ||=1;
+    $uid_revision_pid{$uid}{$revision}{$pid} ||= 1;
+    $uid_pid_revision{$uid}{$pid}{$revision} ||=1;
 }
 
 sub on_quit {
@@ -174,28 +253,36 @@ sub on_quit {
 
     # Maybe we shut down because the given pid is gone...
     my $pid = $client->pid;
-    if (!kill(0, $pid)) {
-        if (my $revisions = delete $pids{$pid}) {
-            for my $revision (keys %$revisions) {
-                delete $state{$revision}{$pid};
-                delete $state{$revision} if !%{$state{$revision}};
-            }
-            # Be more carefull deleting in PATH_EXPORT
-            # We want absolutely no risk of partial deletes
-            my $delete;
-            my $exp_dir = PATH_EXPORT;
-            for my $revision (keys %$revisions) {
-                next if $state{$revision};
-                rmtree(PATH_STATE . "/$revision");
-                my $path = "$exp_dir/$revision";
-                lstat($path) || $! == ENOENT || $! == ESTALE ||
-                    die "Could not lstat($path): $!";
-                if (-e _) {
-                    $delete ||= 1;
-                    stage_delete($path);
+    my $uid = $client->uid;
+    my $dir_uid = PATH_BASE . "/$uid";
+    my $pid_revision = $uid_pid_revision{$uid};
+    my $revision_pid = $uid_revision_pid{$uid};
+    if ($pid_revision && !kill(0, $pid)) {
+        if (my $revisions = delete $pid_revision->{$pid}) {
+            if (%$pid_revision) {
+                # Still something left
+                for my $revision (keys %$revisions) {
+                    delete $revision_pid->{$revision}{$pid};
+                    delete $revision_pid->{$revision} if !%{$revision_pid->{$revision}};
                 }
+                my $dir_state  = "$dir_uid/" . NAME_STATE;
+                my $dir_export = "$dir_uid/" . NAME_EXPORT;
+                for my $revision (keys %$revisions) {
+                    next if $revision_pid->{$revision};
+                    rmtree("$dir_state/$revision");
+                    # Be more carefull deleting in $dir_export
+                    # We want absolutely no risk of partial deletes
+                    my $path_export = "$dir_export/$revision";
+                    lstat($path_export) || $! == ENOENT || $! == ESTALE ||
+                        die "Could not lstat($path_export): $!";
+                    stage_delete($path_export) if -e _;
+                }
+            } else {
+                delete $uid_pid_revision{$uid};
+                delete $uid_revision_pid{$uid};
+                stage_delete($dir_uid);
             }
-            stage_clean() if $delete;
+            stage_clean();
         }
     }
 }
@@ -203,7 +290,8 @@ sub on_quit {
 sub export {
     my ($client, $repo, $commit) = @_;
 
-    my $dir = PATH_EXPORT;
+    my $uid = $client->uid;
+    my $dir_export = PATH_BASE . "/$uid/" . NAME_EXPORT;
     if (!-d $repo) {
         if (-e _) {
             $client->output(CODE_INVALID_REPO, "Repository is not a directory");
@@ -220,12 +308,14 @@ sub export {
         $client->output(CODE_UNKNOWN_REVISION, "Unknown revision $commit");
         return;
     };
-    register($revision, $client->pid);
-    my $path = "$dir/$revision";
-    if (-d $path) {
-        report("info", "Already have $commit exported as $path");
+    register($uid, $client->pid, $revision);
+    my $path_export = "$dir_export/$revision";
+    if (-d $path_export) {
+        report("info", "Already have $commit exported as $path_export");
     } else {
-        report("info", "Git exporting $commit as $path");
+        report("info", "Git exporting $commit as $path_export");
+        # Don't check return of mkdir. The rename will implicitely check it
+        mkdir($dir_export);
         my ($id, $stage_path) = stage_tmp();
         my $out = run_piped(
             [["git", "archive", "--prefix=$id/", $revision], $repo],
@@ -237,15 +327,16 @@ sub export {
         }
         # Allow r-x, but preserve the top level directory or we cannot rename
         permtree($stage_path, 0555, top_keep => 1);
-        rename($stage_path, $path) || do {
+        rename($stage_path, $path_export) || do {
             my $err = $!;
-            # stage_clean();
-            die "Could not rename '$stage_path' to '$path': $err";
+            stage_clean();
+            die "Could not rename '$stage_path' to '$path_export': $err";
         };
-        dir_ro($path);
+        unstage_tmp();
+        dir_ro($path_export);
     }
-    $path = escape(cwd_path($path));
-    $client->output(CODE_EXPORTED, "$revision $path");
+    my $escaped = escape(cwd_path($path_export));
+    $client->output(CODE_EXPORTED, "$revision $escaped");
 }
 
 sub on_line {
@@ -306,7 +397,10 @@ eval {
     report_start();
     report("info", "Running as pid $$");
 
-    mkdirs(PATH_BASE);
+    if (! eval { dir_rw(PATH_BASE) }) {
+        mkdirs(PATH_BASE);
+        dir_rw(PATH_BASE);
+    }
     $lock = lock_file(cwd_path(LOCK_PATH));
 
     my $fh = is_systemd();
@@ -343,8 +437,6 @@ eval {
 
     rmtree(PATH_STAGE, silent => 1);
     mkdir(PATH_STAGE, 0700) || die "Could not mkdir(", PATH_STAGE, "): $!";
-    mkdirs(PATH_STATE);
-    mkdirs(PATH_EXPORT);
     state_read();
 
     Git::ExportDaemon->init();

@@ -510,7 +510,7 @@ sub rmtree {
         # Directory must be executable to access it
         # Directory must be readable to list it
         # Also avoid changes by other (rmtree remains racy though)
-        my $mode_new = ($mode | 0700) & ~ 022;
+        my $mode_new = ($mode | 0700) & ~ 07022;
         $mode == $mode_new || chmod($mode_new, $path) ||
             die "Could not chmod($path): $!";
         my $top_keep = delete $params{top_keep};
@@ -538,7 +538,7 @@ sub permtree {
     my $mode = $lstat[MODE] & 07777;
     if (-d _) {
         # Remove group and other write, add user read/write/execute
-        my $mode_new = $mode & ~ 022 | 0700;
+        my $mode_new = $mode & ~ 07022 | 0700;
         if ($mode_new != $mode) {
             chmod($mode_new, $path) || die "Could not chmod($path): $!";
             $mode = $mode_new;
@@ -561,32 +561,34 @@ sub permtree {
 # Remove group and other write, Add user read, write, execute
 # (Directory must be writable in order to move it)
 sub dir_rw {
-    my ($path) = @_;
+    my ($path, $allow) = @_;
 
     my @lstat = lstat($path) or do {
         next if $! == ESTALE || $! == ENOENT;
         die "Could not lstat($path): $!";
     };
-    -d _ || return;
+    -d _ || return 0;
     my $mode = $lstat[MODE] & 07777;
-    my $mode_new = $mode & ~ 022 | 0700;
+    my $mode_new = ($mode | 0700) & ($allow // ~ 07022);
     $mode == $mode_new || chmod($mode_new, $path) ||
         die "Could not chmod($path): $!";
+    return 1;
 }
 
 # Remove all write, add user read and execute
 sub dir_ro {
-    my ($path) = @_;
+    my ($path, $allow) = @_;
 
     my @lstat = lstat($path) or do {
         next if $! == ESTALE || $! == ENOENT;
         die "Could not lstat($path): $!";
     };
-    -d _ || return;
+    -d _ || return 0;
     my $mode = $lstat[MODE] & 07777;
-    my $mode_new = $mode & ~ 0222 | 0500;
+    my $mode_new = ($mode | 0500) & ($allow // ~ 07222);
     $mode == $mode_new || chmod($mode_new, $path) ||
         die "Could not chmod($path): $!";
+    return 1;
 }
 
 sub run {
