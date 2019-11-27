@@ -33,27 +33,34 @@ use constant {
     NAME_SOCKET			=> "S.git-exportd",
 
     CODE_SHUTDOWN		=> 101,
+    CODE_INTERNAL_PROBLEM	=> 199,
+    CODE_LIST			=> 211,
     CODE_HELP			=> 214,
     CODE_GREETING		=> 220,
     CODE_QUIT			=> 221,
+    CODE_OK			=> 222,
     CODE_EXPORTED		=> 251,
     CODE_INVALID_USER		=> 501,
     CODE_UNKNOWN_COMMAND	=> 502,
     CODE_INVALID_PID		=> 503,
-    CODE_INTERNAL_ERROR		=> 504,
-    CODE_WRONG_ARGUMENTS	=> 505,
+    # Wrong number of arguments
+    CODE_WRONG_ARGUMENTS	=> 504,
+    # Wrong arguments syntax
+    CODE_INVALID_ARGUMENT	=> 505,
     CODE_UNKNOWN_REVISION	=> 506,
     CODE_GIT_ERROR		=> 507,
     CODE_INVALID_REPO		=> 508,
     CODE_PERMISSION_DENIED	=> 509,
+    CODE_INTERNAL_ERROR		=> 599,
 };
 
 require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
-     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     CODE_PERMISSION_DENIED NAME_SOCKET DEV INO MODE UID GID S_ISLNK S_ISDIR
+     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP CODE_OK
+     CODE_LIST CODE_PERMISSION_DENIED CODE_INVALID_ARGUMENT
+     NAME_SOCKET DEV INO MODE UID GID S_ISLNK S_ISDIR
      client_git_export client_response_parse git_rev_parse git git_dir path_stat
      run_piped is_systemd mkdirs rmtree permtree cwd_path lock_file blocking
      dir_ro dir_rw report report_start escape unescape trust_check);
@@ -188,19 +195,23 @@ sub blocking(*;$) {
 }
 
 sub is_systemd {
-    my $pid = $ENV{LISTEN_PID} || return undef;
+    my $pid = $ENV{LISTEN_PID} || return;
     if ($pid ne $$) {
         report("warning", "Unexpected LISTEN_PID=$pid (expected $$)");
-        return undef;
+        return;
     }
-    my $fds = $ENV{LISTEN_FDS} || return undef;
-    if ($fds ne "1") {
-        report("warning", "Unexpected LISTEN_FDS=$fds (expected 1)");
-        return undef;
+    my $fds = $ENV{LISTEN_FDS} || return;
+    if ($fds !~ /^[1-9][0-9]*\z/) {
+        report("warning", "Unexpected LISTEN_FDS=$fds (expected a number)");
+        return;
     }
-    my $fd = LISTEN_FDS_START;
-    open(my $fh, "+>&=", $fd) || die "Could not fdopen($fd): $!";
-    return $fh;
+
+    my @fh;
+    for my $fd (LISTEN_FDS_START .. LISTEN_FDS_START + $fds - 1) {
+        open(my $fh, "+>&=", $fd) || die "Could not fdopen($fd): $!";
+        push @fh, $fh;
+    }
+    return @fh;
 }
 
 sub output {
@@ -222,6 +233,7 @@ sub output {
     if ($was_empty && $client->{buffer_out} ne "") {
         $client->add_write($client->{handle}, sub { $client->can_write() });
     }
+    $client->{did_respond} ||= $code >= 200;
 }
 
 # Only marks that we want to finish.
@@ -232,8 +244,10 @@ sub finish {
     $reason || croak("Assertion: No finish reason given");
     return if $client->{finishing};
 
-    $response = "Internal error" if $code == CODE_INTERNAL_ERROR;
-    $client->output($code, $response // $reason);
+    $response //=
+        $code == CODE_INTERNAL_ERROR || $code == CODE_INTERNAL_PROBLEM ?
+        "Internal error" : $reason;
+    $client->output($code, $response);
     $client->{finishing} = $reason;
     $client->{buffer_in} = "";
 }
@@ -278,14 +292,13 @@ sub can_read {
             my $line = $client->{buffer_in} . substr($buffer, 0, $pos+1, "");
             $client->{buffer_in} = "";
             $line =~ s/\s+\z//;
-            eval {
-                $client->{callbacks}{on_line}->($client, $line);
-            };
+            $client->{did_respond} = 0;
+            eval { $client->{callbacks}{on_line}->($client, $line) };
             if (my $err = $@) {
                 $err =~ s/\s+\z//;
                 $err = "on_line callback died: $err";
                 report("err", $err);
-                $client->finish(CODE_INTERNAL_ERROR, $err);
+                $client->output($client->{did_respond} ? CODE_INTERNAL_PROBLEM : CODE_INTERNAL_ERROR, $err);
             }
             last if $client->{finishing};
         }
@@ -347,6 +360,11 @@ sub user {
 
 sub gid {
     return shift->{gid};
+}
+
+sub is_manager {
+    my $uid = shift->uid;
+    return $uid == $> || $uid == 0;
 }
 
 sub group {
@@ -878,7 +896,7 @@ sub client_git_export {
         die "Unexpected export response from Git-ExportDaemon: $code $response\n";
     !$quit || print($fh "quit\n") ||
         die "Error writing to Git-ExportDaemon: $!\n";
-    my ($revision, $path) = $response =~ /^([0-9a-f]{40})\s+(\S+)\z/ or
+    my ($uid, $revision, $path) = $response =~ /^([1-9][0-9]*|0)\s+([0-9a-f]{40})\s+(\S+)\z/ or
         die "Could not parse export response from Git-ExportDaemon: $response\n";
     if ($quit && $quit_wait) {
         ($code, $response) = client_response_parse($fh);
@@ -886,7 +904,7 @@ sub client_git_export {
             die "Unexpected quit response from Git-ExportDaemon: $code $response\n";
     }
     close($fh);
-    return $revision, unescape($path);
+    return $uid, $revision, unescape($path);
 }
 
 1;

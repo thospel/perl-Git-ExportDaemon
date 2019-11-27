@@ -5,7 +5,7 @@ use warnings;
 use FindBin qw($Script $Bin);
 
 # If the program runs as /foobar/bin/program, find libraries in /foobar/lib
-my ($base, %uid_revision_pid, %uid_pid_revision, $private_socket);
+my ($base, %uid_revision_pid, %uid_pid_revision, $manual_socket);
 BEGIN {
     # Even on windows FindBin uses / in the reported path
     $Bin = $FindBin::Bin;
@@ -25,23 +25,26 @@ BEGIN {
 use Errno qw(ENOENT ESTALE);
 use IO::Socket::UNIX;
 
-use constant {
-    PATH_BASE	=> "state/Git-ExportDaemon",
-};
-
 use Git::ExportDaemon qw
     (CODE_QUIT CODE_WRONG_ARGUMENTS CODE_UNKNOWN_REVISION CODE_GIT_ERROR
-     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP
-     CODE_PERMISSION_DENIED MODE NAME_SOCKET S_ISDIR
+     CODE_EXPORTED CODE_UNKNOWN_COMMAND CODE_INVALID_REPO CODE_HELP CODE_OK
+     CODE_LIST CODE_PERMISSION_DENIED CODE_INVALID_ARGUMENT
+     MODE NAME_SOCKET S_ISDIR
      is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
      path_stat run_piped escape unescape lock_file cwd_path dir_rw dir_ro
      trust_check);
 
 use constant {
+    PATH_BASE	=> "state/Git-ExportDaemon",
+    NAME_PID    => "git-exportd.pid",
     NAME_STATE	=> "state",
     NAME_EXPORT	=> "export",
+};
+
+use constant {
     PATH_STAGE	=> PATH_BASE . "/stage",
     PATH_SOCKET	=> PATH_BASE . "/" . NAME_SOCKET,
+    PATH_PID	=> PATH_BASE . "/" . NAME_PID,
     LOCK_PATH	=> PATH_BASE . "/git-exportd.lock",
 };
 
@@ -186,17 +189,17 @@ sub state_read {
                 next;
             }
             my ($uid) = $f =~ /^([1-9][0-9]*|0)\z/ or next;
-            my $path_uid = "$dir/$uid";
+            my $dir_uid = "$dir/$uid";
 
-            if (!dir_rw($path_uid)) {
+            if (!dir_rw($dir_uid)) {
                 # Not a directory!
-                report("warning", "User area $path_uid is not in fact a directory");
-                unlink($path_uid) || $! == ENOENT || $! == ESTALE ||
-                    die "Could not unlink($path_uid): $!";
+                report("warning", "User area $dir_uid is not in fact a directory");
+                unlink($dir_uid) || $! == ENOENT || $! == ESTALE ||
+                    die "Could not unlink($dir_uid): $!";
                 next;
             }
 
-            state_read_uid($path_uid,
+            state_read_uid($dir_uid,
                            $uid_revision_pid->{$uid} ||= {},
                            $uid_pid_revision->{$uid} ||= {});
             if (%{$uid_revision_pid->{$uid}}) {
@@ -207,7 +210,7 @@ sub state_read {
                 # But if so you may need to fixup export and state since
                 # state_read_uid currently doesn't bother if it knows uid will
                 # get cleaned up
-                stage_delete($path_uid);
+                stage_delete($dir_uid);
                 %{$uid_pid_revision->{$uid}} &&
                     die "Assertion: Inconsistent pid/revision state";
                 delete $uid_revision_pid->{$uid};
@@ -352,7 +355,49 @@ sub export {
         dir_ro($path_export) if $>;
     }
     my $escaped = escape(cwd_path($path_export));
-    $client->output(CODE_EXPORTED, "$revision $escaped");
+    $client->output(CODE_EXPORTED, "$uid $revision $escaped");
+}
+
+sub unexport {
+    my ($client, $uid, $revision) = @_;
+
+    my $revision_pid = $uid_revision_pid{$uid};
+    defined $revision_pid && exists $revision_pid->{$revision} || do {
+        $client->output(CODE_UNKNOWN_REVISION, "Unknown revision");
+        return;
+    };
+    my $pid = $client->pid;
+    delete $revision_pid->{$revision}{$pid} // do {
+        $client->output(CODE_UNKNOWN_REVISION, "Known revision but not for your pid '$pid'");
+        return;
+    };
+    my $pid_revision = $uid_pid_revision{$uid};
+    delete $pid_revision->{$pid}{$revision};
+    delete $pid_revision->{$pid} if !%{$pid_revision->{$pid}};
+
+    if (%{$revision_pid->{$revision}}) {
+        $client->output(CODE_OK, "Unexported but still in use by other pids");
+    } else {
+        delete $revision_pid->{$revision};
+        my $dir_uid = PATH_BASE . "/$uid";
+        if (%$revision_pid) {
+            # This revision is gone but others still exist
+            my $dir_state  = "$dir_uid/" . NAME_STATE;
+            my $dir_export = "$dir_uid/" . NAME_EXPORT;
+            rmtree("$dir_state/$revision");
+            stage_delete("$dir_export/$revision");
+        } else {
+            # Everything is gone for this user
+            die "Assertion: Inconsistent datastructure" if %$pid_revision;
+            delete $uid_revision_pid{$uid};
+            delete $uid_pid_revision{$uid};
+
+            report("info", "Fast delete of $dir_uid");
+            stage_delete($dir_uid);
+        }
+        stage_clean();
+        $client->output(CODE_OK, "Unexported");
+    }
 }
 
 sub on_line {
@@ -376,26 +421,93 @@ sub on_line {
         }
         export($client, $repo, $commit);
         return;
+    } elsif ($command eq "UNEXPORT") {
+        if (@args < 1) {
+            $client->output(CODE_WRONG_ARGUMENTS, "Missing argument(s)");
+            return;
+        }
+        my $rev = shift @args;
+        my ($revision) = $rev =~ /^([0-9a-f]{40})\z/ or do {
+            $client->output(CODE_INVALID_ARGUMENT, "Invalid revision format");
+            return;
+        };
+        my $revision_uid = my $uid = $client->uid;
+        if (my $ru = shift @args) {
+            ($revision_uid) = $ru =~ /^([1-9][0-9]*|0)\z/ or do {
+                $client->output(CODE_INVALID_ARGUMENT, "Invalid uid format");
+                return;
+            };
+            $revision_uid == $uid || $client->is_manager || do {
+                my $user = $client->user;
+                $client->output(CODE_PERMISSION_DENIED, "User '$user' is not allowed to remove for uid '$revision_uid'");
+                return;
+            };
+        }
+        if (@args) {
+            $client->output(CODE_WRONG_ARGUMENTS, "Spurious argument(s)");
+            return;
+        }
+        unexport($client, $revision_uid, $revision);
+    } elsif ($command eq "LIST") {
+        if (@args) {
+            $client->output(CODE_WRONG_ARGUMENTS, "Spurious argument(s)");
+            return;
+        }
+        my $out = "";
+        my @uids = $client->is_manager ? keys %uid_revision_pid : $client->uid;
+        my $n = 0;
+        for my $uid (@uids) {
+            my $revision_pid = $uid_revision_pid{$uid} // next;
+            for my $revision (sort keys %$revision_pid) {
+                $out .= "$uid $revision\n";
+                ++$n;
+            }
+        }
+        # Make sure there is output even if there are no revisions
+        $out .= "exports=$n\n";
+        $client->output(CODE_LIST, $out);
     } elsif ($command eq "HELP") {
         $client->output(CODE_HELP, <<"EOT")
 Commands supported:
 EXPORT <repo> [<commit>]
+UNEXPORT <revision> [<uid]>
+LIST
 QUIT
 SHUTDOWN
+CLEAN_STAGE
 HELP
 EOT
             ;
     } elsif ($command eq "QUIT") {
+        # Don't check arguments. QUIT means QUIT.
         $client->finish(CODE_QUIT, "Manual quit", "Goodbye");
     } elsif ($command eq "SHUTDOWN") {
-        if ($client->uid != $> && $client->uid != 0) {
+        if (@args) {
+            $client->output(CODE_WRONG_ARGUMENTS, "Spurious argument(s)");
+            return;
+        }
+        if (!$client->is_manager) {
             my $user = $client->user;
             $client->output(CODE_PERMISSION_DENIED, "User '$user' is not allowed to shutdown");
             return;
         }
-        Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
         # Cleanup before shutdown
         state_read();
+        $client->output(CODE_OK, "Shutdown in progress");
+        Git::ExportDaemon->shutdown("Manual shutdown by client '$id'");
+    } elsif ($command eq "CLEAN_STAGE") {
+        if (@args) {
+            $client->output(CODE_WRONG_ARGUMENTS, "Spurious argument(s)");
+            return;
+        }
+        if (!$client->is_manager) {
+            my $user = $client->user;
+            $client->output(CODE_PERMISSION_DENIED, "User '$user' is not allowed to clean the stage directory");
+            return;
+        }
+        stage_tmp();
+        stage_clean();
+        $client->output(CODE_OK, "Stage cleaned");
     } else {
         $client->output(CODE_UNKNOWN_COMMAND, "Unknown command '$command'");
     }
@@ -411,6 +523,43 @@ sub on_accept {
     report("info", "Client '$id' connected: pid $pid, user $user, group $group");
 }
 
+# Create the socket ourselves
+sub manual_socket {
+    if (-e PATH_SOCKET) {
+        -S _ || die "Path '", PATH_SOCKET, "' exists but is not a socket\n";
+        die "Something is still listening on '", PATH_SOCKET, "'\n" if
+            IO::Socket::UNIX->new(Peer => PATH_SOCKET);
+    } else {
+        # Check for dangling symlink
+        -l PATH_SOCKET;
+    }
+    !-e _ || unlink(PATH_SOCKET) || $! == ENOENT || $! == ESTALE ||
+        die "Could not unlink '", PATH_SOCKET, "': $!";
+    my $old_umask = umask(0);
+    my $fh = eval {
+        IO::Socket::UNIX->new(
+            Local => PATH_SOCKET,
+            Listen => undef) ||
+                die "Could not open UNIX socket ", PATH_SOCKET, "($!)";
+    };
+    my $err = $@;
+    umask($old_umask);
+    die $err if $err;
+
+    $manual_socket = PATH_SOCKET;
+    report("info",
+           "Created listening socket '%s'", cwd_path($manual_socket));
+    -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
+
+    return $fh;
+}
+
+sub pid_file {
+    open(my $fh, ">", PATH_PID) || die "Could not open '", PATH_PID, "': $!";
+    print($fh "$$\n") || die "Could not write to '", PATH_PID, "': $!";
+    close($fh) || die "Could not close '", PATH_PID, "': $!";
+}
+
 my $lock;
 eval {
     umask($umask);
@@ -421,36 +570,15 @@ eval {
     trust_check(PATH_BASE);
     dir_rw(PATH_BASE);
     $lock = lock_file(cwd_path(LOCK_PATH));
+    pid_file();
 
-    my $fh = is_systemd();
-    if ($fh) {
-        stat($fh) or die "Could not stat passed filehandle: $!";
-        -S $fh || die "Passed filehandle is not a socket\n";
-    } else {
+    my @fh = is_systemd();
+    if (!@fh) {
         my $fd = fileno(STDIN);
-        if (defined $fd) {
-            stat(STDIN) or die "Could not stat STDIN: $!";
-            $fh = \*STDIN if -S _;
-        }
-        if (!$fh) {
-            if (-e PATH_SOCKET) {
-                -S _ || die "Path '", PATH_SOCKET, "' exists but is not a socket\n";
-                die "Something is still listening on '", PATH_SOCKET, "'\n" if
-                    IO::Socket::UNIX->new(Peer => PATH_SOCKET);
-            } else {
-                # Check for dangling symlink
-                -l PATH_SOCKET;
-            }
-            !-e _ || unlink(PATH_SOCKET) || $! == ENOENT || $! == ESTALE ||
-                    die "Could not unlink '", PATH_SOCKET, "': $!";
-            $fh = IO::Socket::UNIX->new(
-                Local => PATH_SOCKET,
-                Listen => undef) ||
-                    die "Could not open UNIX socket ", PATH_SOCKET, "($!)";
-            $private_socket = PATH_SOCKET;
-            report("info",
-                   "Created listening socket '%s'", cwd_path($private_socket));
-            -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
+        if (defined $fd && -S STDIN) {
+            @fh = \*STDIN;
+        } else {
+            @fh = manual_socket();
         }
     }
 
@@ -459,17 +587,20 @@ eval {
     state_read();
 
     Git::ExportDaemon->init();
-    Git::ExportDaemon->listener(
-        $fh,
-        on_quit   => \&on_quit,
-        on_line   => \&on_line,
-        on_accept => \&on_accept,
-    );
+    for my $fh (@fh) {
+        Git::ExportDaemon->listener(
+            $fh,
+            on_quit   => \&on_quit,
+            on_line   => \&on_line,
+            on_accept => \&on_accept,
+        );
+    }
     Git::ExportDaemon->loop();
     report("info", "Exit");
 };
 my $err = $@;
-unlink($private_socket) if defined $private_socket;
+unlink(PATH_PID);
+unlink($manual_socket) if defined $manual_socket;
 if ($err) {
     report("err", $err);
     report("info", "Exit");

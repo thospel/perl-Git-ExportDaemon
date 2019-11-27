@@ -4,8 +4,11 @@ Description=Manage temporary exported git repositories
 [Socket]
 ListenStream=%t/Git-ExportDaemon/S.git-exportd
 FileDescriptorName=std
-SocketMode=0600
-DirectoryMode=0700
+# No real need to restrict socket and directory mode, %t is already restricted.
+# And even if not, the daemon will check who may access the service anyways.
+# But if you *MUST* avoid a connection DOS:
+# SocketMode=0600
+# DirectoryMode=0700
 
 [Install]
 WantedBy=sockets.target
