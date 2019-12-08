@@ -29,6 +29,7 @@ use constant {
     UID				=> 4,
     GID				=> 5,
     MTIME			=> 9,
+    HOME			=> 7,
 
     NAME_SOCKET			=> "S.git-exportd",
 
@@ -723,6 +724,17 @@ sub dir_ro {
     $mode == $mode_new || chmod($mode_new, $path) ||
         die "Could not chmod($path): $!";
     return 1;
+}
+
+sub path_expand {
+    my ($client, $path) = @_;
+
+    if (my ($user, $rest) = $path =~ m{^~([^/]*)(.*)\z}s) {
+        if (my @info = $1 eq "" ? getpwuid($client->uid) : getpwnam($user)) {
+            return $info[HOME] . $rest if $info[HOME] =~ m{^/};
+        }
+    }
+    return cwd_path($path);
 }
 
 sub escape {

@@ -305,17 +305,19 @@ sub export {
     my $gid = $client->gid;
 
     my $dir_export = PATH_BASE . "/$uid/" . NAME_EXPORT;
+    $repo = $client->path_expand($repo);
+    my $repo_escaped = escape($repo);
     my ($err, $stat) = path_stat($repo, $uid, $gid);
     if ($err) {
-        $client->output(CODE_INVALID_REPO, "Cannot access Repository: $err");
+        $client->output(CODE_INVALID_REPO, "Cannot access Repository '$repo_escaped': $err");
         return;
     } elsif (!S_ISDIR($stat->[MODE])) {
-        $client->output(CODE_INVALID_REPO, "Repository is not a directory");
+        $client->output(CODE_INVALID_REPO, "Repository '$repo_escaped' is not a directory");
         return;
     }
 
     if (!defined git_dir($repo, $uid, $gid)) {
-        $client->output(CODE_INVALID_REPO, "Directory '$repo' is not a repository");
+        $client->output(CODE_INVALID_REPO, "Directory '$repo_escaped' is not a repository");
         return;
     }
     my $revision = git_rev_parse($repo, $commit, $uid, $gid) // do {
@@ -360,8 +362,8 @@ sub export {
         unstage_tmp();
         dir_ro($path_export) if $>;
     }
-    my $escaped = escape(cwd_path($path_export));
-    $client->output(CODE_EXPORTED, "$uid $revision $escaped");
+    my $path_export_escaped = escape($path_export);
+    $client->output(CODE_EXPORTED, "$uid $revision $path_export_escaped");
 }
 
 sub unexport {
@@ -409,8 +411,17 @@ sub unexport {
 sub on_line {
     my ($client, $line) = @_;
 
+    my $to_delete = to_delete();
+    die "Unexpected stage state (to_delete=$to_delete)" if $to_delete;
+
     my @args = split " ", $line or return;
-    $_ = unescape($_) for @args;
+    for (@args) {
+        $_ = unescape($_);
+        if (/\0/) {
+            $client->output(CODE_INVALID_ARGUMENT, "Value contains \\0");
+            return;
+        }
+    }
     my $command = uc shift @args;
     my $id    = $client->id;
 
@@ -517,8 +528,6 @@ EOT
     } else {
         $client->output(CODE_UNKNOWN_COMMAND, "Unknown command '$command'");
     }
-    my $to_delete = to_delete();
-    die "Unexpected stage state (to_delete=$to_delete)" if $to_delete;
 }
 
 sub on_accept {
