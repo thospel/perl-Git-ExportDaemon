@@ -63,7 +63,7 @@ our @EXPORT_OK = qw
      NAME_SOCKET DEV INO MODE UID GID S_ISLNK S_ISDIR
      client_git_export client_response_parse git_rev_parse git git_dir path_stat
      run_piped is_systemd mkdirs rmtree permtree cwd_path lock_file blocking
-     dir_ro dir_rw report report_start escape unescape trust_check);
+     dir_force dir_ro dir_rw report report_start escape unescape trust_check);
 
 sub report_start {
     my $ident    = shift // $Script;
@@ -308,7 +308,7 @@ sub can_read {
     if (defined $rc) {
         # EOF
         if ($client->{finishing}) {
-            $client->quit("Expected EOF ($client->{finishing})");
+            $client->quit("The expected EOF ($client->{finishing})");
         } else {
             $client->quit("Unexpected EOF");
         }
@@ -427,6 +427,8 @@ sub acceptable {
 sub listener {
     my ($class, $fh, %callbacks) = @_;
 
+    -S $fh || croak "Handle is not a socket";
+
     my $callbacks = {
         on_quit   => delete $callbacks{on_quit}   || \&nop,
         on_line   => delete $callbacks{on_line}   || \&nop,
@@ -510,6 +512,17 @@ sub mkdirs {
             $! == EEXIST || croak "Could not mkdir($target): $!";
             -d $target || croak "'$target' exists but is not a directory";
         }
+    }
+}
+
+# Force a directory with given mode to exist (but assume the parent exists)
+sub dir_force {
+    my ($dir, $mode) = @_;
+
+    if (!mkdir($dir, 0700)) {
+        $! == EEXIST || die "Could not mkdir($dir): $!";
+        -d $dir || die "Path '$dir' exists but is not a directory";
+        chmod(0700, $dir) || die "Could not chmod($dir): $!";
     }
 }
 
@@ -614,27 +627,27 @@ sub rmtree {
     };
     my $mode = $lstat[MODE] & 07777;
     if (-d _) {
-        if ($lstat[UID] != $> || $lstat[GID] != $)) {
-            chown($>, $), $path) || die "Could not chown($path): $!";
-            @lstat = lstat($path) or die "Could not lstat($path): $!";
-            $mode = $lstat[MODE] & 07777;
-            # Sanity check, no more
-            # If the lower levels aren't secure this will not save you
-            $lstat[UID] == $> || croak "Assertion: chown uid was ineffective";
-            $lstat[GID] == $) || croak "Assertion: chown gid was ineffective";
+        if ($>) {
+            # Directory must be writable to be able to remove things from it
+            # Directory must be executable to access it
+            # Directory must be readable to list it
+            # Also avoid changes by other (rmtree remains racy though)
+            my $mode_new = ($mode | 0700) & ~ 07022;
+            $mode == $mode_new || chmod($mode_new, $path) ||
+                die "Could not chmod($path): $!";
         }
-        # Directory must be writable to be able to remove things from it
-        # Directory must be executable to access it
-        # Directory must be readable to list it
-        # Also avoid changes by other (rmtree remains racy though)
-        my $mode_new = ($mode | 0700) & ~ 07022;
-        $mode == $mode_new || chmod($mode_new, $path) ||
-            die "Could not chmod($path): $!";
         my $top_keep = delete $params{top_keep};
         opendir(my $dh, $path) || die "Could not opendir($path): $!";
         for my $f (readdir $dh) {
             next if $f eq "." || $f eq "..";
-            rmtree("$path/$f", %params);
+
+            if ($lstat[UID] != $> || $lstat[GID] != $)) {
+                $params{untrusted_dir} ||
+                    croak "Will not remove directory '$path/$f' (untrusted containing directory)";
+                $params{untrusted_dir}->("$path/$f");
+            } else {
+                rmtree("$path/$f", %params);
+            }
         }
         $top_keep || rmdir($path) || $! == ENOENT || $! == ESTALE ||
             die "Could not rmdir($path): $!";
@@ -646,6 +659,8 @@ sub rmtree {
 
 sub permtree {
     my ($path, $allow, %params) = @_;
+
+    $> || croak "Refuse to run permtree as root";
 
     # lstat so we don't follow symlinks
     my @lstat = lstat($path) or do {
@@ -695,6 +710,8 @@ sub dir_rw {
 # Remove all write, add user read and execute
 sub dir_ro {
     my ($path, $allow) = @_;
+
+    $> || croak "Refuse to run dir_ro as root";
 
     my @lstat = lstat($path) or do {
         next if $! == ESTALE || $! == ENOENT;

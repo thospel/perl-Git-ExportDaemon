@@ -32,7 +32,7 @@ use Git::ExportDaemon qw
      MODE NAME_SOCKET S_ISDIR
      is_systemd report report_start mkdirs rmtree permtree git_rev_parse git_dir
      path_stat run_piped escape unescape lock_file cwd_path dir_rw dir_ro
-     trust_check);
+     dir_force trust_check);
 
 use constant {
     PATH_BASE	=> "state/Git-ExportDaemon",
@@ -55,15 +55,19 @@ my $umask = 022;
     my $stage_id = "A";
     sub stage_tmp {
         my $id = $stage_id++;
-        # Gives just the fresh path in scalar context
-        return $id, PATH_STAGE . "/$id";
         # Supposedly something will be placed in stage. Mark it for cleanup
         # Call unstage_tmp if you remove it from stage again
         ++$to_delete;
+        # Gives just the fresh path in scalar context
+        return $id, PATH_STAGE . "/$id";
     }
 
     sub unstage_tmp {
         --$to_delete;
+    }
+
+    sub to_delete {
+        return $to_delete;
     }
 
     sub stage_delete {
@@ -78,9 +82,11 @@ my $umask = 022;
     }
 
     sub stage_clean {
-        $to_delete || return;
-        rmtree(PATH_STAGE, top_keep => 1, silent => 1);
-        $to_delete = 0;
+        while ($to_delete) {
+            $to_delete = 0;
+            rmtree(PATH_STAGE, top_keep => 1, silent => 1,
+                   untrusted_dir => \&stage_delete);
+        }
     }
 }
 
@@ -511,6 +517,8 @@ EOT
     } else {
         $client->output(CODE_UNKNOWN_COMMAND, "Unknown command '$command'");
     }
+    my $to_delete = to_delete();
+    die "Unexpected stage state (to_delete=$to_delete)" if $to_delete;
 }
 
 sub on_accept {
@@ -549,7 +557,6 @@ sub manual_socket {
     $manual_socket = PATH_SOCKET;
     report("info",
            "Created listening socket '%s'", cwd_path($manual_socket));
-    -S $fh || die "Assertion: Just created IO::Socket::UNIX filehandle is not a socket";
 
     return $fh;
 }
@@ -582,8 +589,9 @@ eval {
         }
     }
 
-    rmtree(PATH_STAGE, silent => 1);
-    mkdir(PATH_STAGE, 0700) || die "Could not mkdir(", PATH_STAGE, "): $!";
+    dir_force(PATH_STAGE, 0700);
+    stage_tmp();
+    stage_clean();
     state_read();
 
     Git::ExportDaemon->init();
